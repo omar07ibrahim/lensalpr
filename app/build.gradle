@@ -1,0 +1,123 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.lensalpr.app'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.lensalpr.app"
+        // Camera2 physical-camera metadata (LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID,
+        // physicalCameraTotalResults) is the backbone of the lens proof, so the app targets
+        // devices that expose it without legacy fallbacks.
+        minSdk 31
+        targetSdk 36
+        versionCode 1
+        versionName "1.0.0"
+
+        ndk {
+            // The vendor ALPR AAR ships ARM64 native libraries only.
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildFeatures {
+        viewBinding true
+        buildConfig true
+    }
+
+    androidResources {
+        // ONNX weights are mmap'ed from a private file copy; keeping them stored makes the
+        // one-time asset extraction a straight copy instead of an inflate.
+        noCompress += ['onnx']
+    }
+
+    signingConfigs {
+        // The Android debug key, used for the release build on purpose. This app is sideloaded
+        // onto one phone and never published, and signing release with the same key that signed
+        // every previous install is what lets a new build replace the old one without wiping the
+        // evidence database. Swap this for a real keystore before it ever leaves this phone.
+        release {
+            storeFile file("${System.getProperty('user.home')}/.android/debug.keystore")
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+        }
+        release {
+            // Not debuggable: ART optimises a release build far more aggressively, and on a
+            // pipeline that has 25 ms per frame to detect, crop and track, that is not a detail.
+            debuggable false
+            // The ALPR and YOLO paths reach native code through reflection-sensitive wrappers and
+            // the win from shrinking a sideloaded app is nil, so the risk is not worth taking.
+            minifyEnabled false
+            signingConfig signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    lint {
+        // This app is sideloaded onto one phone from a machine that is often offline, and
+        // lintVital pulls its analyzer down from the network at build time. A release build that
+        // cannot be produced without internet is worse than one that skips a style check.
+        checkReleaseBuilds false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/DEPENDENCIES', 'META-INF/LICENSE*', 'META-INF/NOTICE*']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.18.0'
+    implementation 'androidx.appcompat:appcompat:1.7.1'
+    implementation 'com.google.android.material:material:1.14.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.2.1'
+    implementation 'androidx.recyclerview:recyclerview:1.4.0'
+    implementation 'androidx.preference:preference-ktx:1.2.1'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.11.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
+
+    // Follow detection needs fused location with bearing and speed.
+    implementation 'com.google.android.gms:play-services-location:21.3.0'
+    // Telegram Bot API: long polling plus multipart photo/document uploads.
+    implementation 'com.squareup.okhttp3:okhttp:5.3.0'
+
+    def cameraxVersion = '1.6.1'
+    implementation "androidx.camera:camera-core:$cameraxVersion"
+    implementation "androidx.camera:camera-camera2:$cameraxVersion"
+    implementation "androidx.camera:camera-lifecycle:$cameraxVersion"
+    implementation "androidx.camera:camera-view:$cameraxVersion"
+    implementation "androidx.camera:camera-video:$cameraxVersion"
+
+    // YOLO26 inference runtime (XNNPACK / NNAPI execution providers).
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.27.0'
+
+    // Vehicle/plate OCR + make-model-year classifier (native engine).
+    implementation project(path: ':libttvalpr')
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+}

@@ -1,0 +1,11 @@
+# Build output only — regenerable by ./gradlew, and 725 MB of it.
+#
+# Everything else is deliberately tracked: sources, the vendor ALPR AAR, the ONNX weights, the
+# device backup with its evidence photos and database, and the credentials compiled into
+# TelegramDefaults.kt. This repository is a private archive of the whole project, not something
+# to be published or distributed.
+build/
+app/build/
+libttvalpr/build/
+.gradle/
+.kotlin/

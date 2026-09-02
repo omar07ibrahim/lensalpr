@@ -1,0 +1,3 @@
+// The vendor ALPR SDK ships as a prebuilt AAR (native engine + model assets).
+configurations.maybeCreate("default")
+artifacts.add("default", file('libttvalpr.aar'))

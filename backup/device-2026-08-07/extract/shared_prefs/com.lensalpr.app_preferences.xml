@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="detector_model">REACH</string>
+    <int name="detector_threads" value="6" />
+    <boolean name="recognition_rectify" value="false" />
+    <string name="lens_plan">[{&quot;id&quot;:&quot;opt_6&quot;,&quot;dwell&quot;:5},{&quot;id&quot;:&quot;opt_7&quot;,&quot;dwell&quot;:5},{&quot;id&quot;:&quot;dig_8&quot;,&quot;dwell&quot;:5},{&quot;id&quot;:&quot;dig_9&quot;,&quot;dwell&quot;:5}]</string>
+    <int name="detector_min_box" value="96" />
+    <int name="alert_after_encounters" value="2" />
+    <int name="recognition_max_crops" value="3" />
+    <boolean name="telegram_enabled" value="true" />
+    <float name="detector_confidence" value="0.35" />
+    <boolean name="follow_enabled" value="true" />
+    <boolean name="camera_direct_physical" value="false" />
+    <string name="telegram_token">7834189384:AAHNEkhPgrW_QLrd5VnsRkS8pMfQPMMzxmg</string>
+    <string name="capture_resolution">UHD</string>
+    <boolean name="recognition_strict_format" value="false" />
+    <long name="telegram_owner" value="738339858" />
+    <int name="recognition_consensus" value="2" />
+    <boolean name="recognition_strict_lens" value="true" />
+    <boolean name="follow_voice" value="true" />
+    <int name="recognition_min_score" value="45" />
+    <int name="recognition_interval" value="220" />
+    <string name="detector_accel">XNNPACK</string>
+    <int name="recognition_narrow_crops" value="2" />
+    <boolean name="recognition_vmmr" value="true" />
+    <int name="alert_min_level" value="2" />
+    <boolean name="recognition_deep" value="true" />
+</map>
