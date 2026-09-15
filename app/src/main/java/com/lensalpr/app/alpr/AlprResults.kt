@@ -103,11 +103,12 @@ object AlprJson {
 
     private fun parsePlate(item: JSONObject, strictLatvia: Boolean): PlateReading? {
         val raw = item.optString("text").trim()
-        val plate = PlateFormats.parse(raw, strictLatvia) ?: return null
+        val country = item.optJSONArray("country")?.optJSONObject(0)
+        val countryCode = country?.optString("code")?.nullIfBlank()
+        val plate = PlateFormats.parse(raw, strictLatvia, countryCode) ?: return null
         val box = boxOf(item.optJSONArray("warpedBox"))
         if (!plausiblePlateShape(box?.width() ?: 0f, box?.height() ?: 0f)) return null
         val confidences = item.optJSONArray("confidences")
-        val country = item.optJSONArray("country")?.optJSONObject(0)
         return PlateReading(
             text = plate.key,
             rawText = raw,
@@ -115,7 +116,7 @@ object AlprJson {
             corrected = plate.corrected,
             recognitionScore = score(confidences?.optDouble(0, 0.0)),
             detectionScore = score(confidences?.optDouble(1, 0.0)),
-            countryCode = country?.optString("code")?.nullIfBlank(),
+            countryCode = countryCode,
             countryName = country?.optString("name")?.nullIfBlank(),
             state = country?.optString("state")?.nullIfBlank(),
             car = item.optJSONObject("car")?.let(::parseCar),

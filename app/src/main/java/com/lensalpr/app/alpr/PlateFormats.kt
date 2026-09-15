@@ -63,20 +63,28 @@ object PlateFormats {
     private val ROAD_NUMBER = Regex("^[AEP][0-9]{1,3}$")
     private val PLACE_NAMES = setOf("RIGA", "OGRE", "CESIS", "ADAZI", "SALDUS", "TALSI", "LIMBAZI")
 
-    fun parse(raw: String?, strictLatvia: Boolean = false): Plate? {
+    /** OCR substitutions require an explicit local format or an LV country hint. */
+    fun parse(raw: String?, strictLatvia: Boolean = false, countryCode: String? = null): Plate? {
         val cleaned = clean(raw) ?: return null
         if (isSignage(cleaned)) return null
-
         latvian(cleaned, corrected = false)?.let { return it }
-        // Correction is exactly how a road sign sneaks back in: "P1O4" is one O-for-zero flip away
-        // from the P104 that was just refused, and that flip is the commonest misread there is.
-        correctToLatvian(cleaned)?.takeUnless { isSignage(it.key) }?.let { return it }
+
+        val corrected = correctToLatvian(cleaned)
+        // A rejected sign must not re-enter through the generic fallback as P1O4 or R1GA12.
+        if (corrected != null && isSignage(corrected.key)) return null
+        val country = countryCode?.trim()?.takeUnless { it.isEmpty() || it.equals("null", true) }
+        val mayCorrect = country.equals("LV", ignoreCase = true) || (strictLatvia && country == null)
+        if (mayCorrect && corrected != null) return corrected
         if (strictLatvia) return null
         return generic(cleaned)
     }
 
-    /** Same rules, for text typed by a human (a plate sent to the bot, for instance). */
-    fun key(raw: String?): String? = parse(raw, strictLatvia = false)?.key
+    /** Human input normalizes separators/case/look-alikes, never speculative OCR mistakes. */
+    fun key(raw: String?): String? {
+        val cleaned = clean(raw) ?: return null
+        if (isSignage(cleaned)) return null
+        return latvian(cleaned, corrected = false)?.key ?: generic(cleaned)?.key
+    }
 
     /** True for the road numbers and place names that share a plate's shape. */
     fun isSignage(text: String): Boolean {

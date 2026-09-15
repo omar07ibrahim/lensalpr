@@ -26,6 +26,13 @@
         android:name="android.hardware.camera.autofocus"
         android:required="false" />
 
+    <!-- Required for discovering speech engines on Android 11 and newer. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:name=".LensAlprApp"
         android:allowBackup="false"

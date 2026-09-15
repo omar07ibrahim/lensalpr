@@ -1,5 +1,6 @@
 package com.lensalpr.app
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,11 +8,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 
 /**
  * Keeps the scanning session alive.
@@ -36,13 +40,27 @@ class ScanSessionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
+        if (intent == null || intent.action == ACTION_STOP) {
             stopSelf()
             return START_NOT_STICKY
         }
-        startForegroundCompat(intent?.getStringExtra(EXTRA_STATUS) ?: getString(R.string.service_running))
-        acquireWakeLock()
-        return START_STICKY
+        // The activity owns the pipeline; restarting this service alone cannot restore a scan.
+        if (!hasPermission(Manifest.permission.CAMERA)) {
+            Log.w(WAKE_TAG, "Cannot start a scanning service without camera permission")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        try {
+            startForegroundCompat(intent.getStringExtra(EXTRA_STATUS) ?: getString(R.string.service_running))
+            acquireWakeLock()
+        } catch (error: RuntimeException) {
+            // Promotion is a later framework callback: start() cannot catch this failure.
+            Log.e(WAKE_TAG, "Cannot promote the scanning service to foreground", error)
+            releaseWakeLock()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+        return START_NOT_STICKY
     }
 
     private fun acquireWakeLock() {
@@ -58,11 +76,18 @@ class ScanSessionService : Service() {
         }.onSuccess { wakeLock = it }
     }
 
-    override fun onDestroy() {
+    private fun releaseWakeLock() {
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
+    }
+
+    override fun onDestroy() {
+        releaseWakeLock()
         super.onDestroy()
     }
+
+    private fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
     private fun startForegroundCompat(status: String) {
         val manager = getSystemService(NotificationManager::class.java)
@@ -105,7 +130,9 @@ class ScanSessionService : Service() {
                 NOTIFICATION_ID,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+                    if (hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ||
+                        hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                    ) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)

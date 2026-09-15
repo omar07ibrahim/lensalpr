@@ -41,6 +41,7 @@ class LensRotationScheduler(
     private var running = false
     private var paused = false
     private var remainingWhenPaused = 0L
+    private var pausedAt = 0L
 
     val current: PlanEntry?
         get() = entries.getOrNull(index)
@@ -49,18 +50,20 @@ class LensRotationScheduler(
         get() = entries.size
 
     fun configure(entries: List<PlanEntry>) {
-        this.entries = entries
+        stop()
+        this.entries = entries.toList()
         index = 0
+        holding = false
+        remainingWhenPaused = 0L
     }
 
     fun start() {
-        if (entries.isEmpty()) return
+        if (running || entries.isEmpty()) return
         running = true
-        paused = false
         index = 0
         switchTo(index)
         handler.removeCallbacks(ticker)
-        handler.post(ticker)
+        if (running) handler.post(ticker)
     }
 
     fun stop() {
@@ -72,10 +75,13 @@ class LensRotationScheduler(
         if (paused == value) return
         val now = SystemClock.elapsedRealtime()
         if (value) {
-            if (holding) remainingWhenPaused = (holdUntil - now).coerceAtLeast(0L)
+            pausedAt = now
+            remainingWhenPaused = if (holding) (holdUntil - now).coerceAtLeast(0L)
+                else current?.dwellMs ?: 0L
         } else {
-            // Resume with the slice that was left, not with an instant switch.
+            // Paused time consumes neither the dwell nor the pending settle timeout.
             if (holding) holdUntil = now + remainingWhenPaused
+            else switchedAt += (now - pausedAt).coerceAtLeast(0L)
             remainingWhenPaused = 0L
         }
         paused = value
@@ -84,9 +90,8 @@ class LensRotationScheduler(
     /** Called by the camera controller once the requested step is live. */
     fun onStepSettled(step: ZoomStep) {
         val entry = current ?: return
-        if (entry.step.id != step.id || holding) return
-        holding = true
-        holdUntil = SystemClock.elapsedRealtime() + entry.dwellMs
+        if (!running || entry.step.id != step.id || holding) return
+        beginHold(entry, SystemClock.elapsedRealtime())
     }
 
     /** Skips the rest of the current dwell. */
@@ -100,39 +105,43 @@ class LensRotationScheduler(
         val entry = entries.getOrNull(target) ?: return
         holding = false
         switchedAt = SystemClock.elapsedRealtime()
+        if (paused) pausedAt = switchedAt
         holdUntil = 0L
+        remainingWhenPaused = entry.dwellMs
         onSwitch(entry)
+    }
+
+    private fun beginHold(entry: PlanEntry, now: Long) {
+        holding = true
+        holdUntil = now + entry.dwellMs
+        if (paused) remainingWhenPaused = entry.dwellMs
     }
 
     private val ticker = object : Runnable {
         override fun run() {
             if (!running) return
-            val entry = current
-            if (entry != null) {
-                val now = SystemClock.elapsedRealtime()
-                if (holding && !paused && entries.size > 1 && now >= holdUntil) {
+            val now = SystemClock.elapsedRealtime()
+            val before = current
+            if (before != null && !paused) {
+                if (holding && entries.size > 1 && now >= holdUntil) {
                     advance()
-                } else if (!holding && now - switchedAt > SETTLE_TIMEOUT_MS) {
-                    // The lens never confirmed; keep the plan moving.
-                    holding = true
-                    holdUntil = now + entry.dwellMs
+                } else if (!holding && now - switchedAt >= SETTLE_TIMEOUT_MS) {
+                    beginHold(before, now)
                 }
+            }
+            // advance() can change the entry; callbacks may also stop the scheduler.
+            val entry = current
+            if (!running) return
+            if (entry != null) {
                 val remaining = when {
                     !holding -> entry.dwellMs
                     paused -> remainingWhenPaused
                     entries.size <= 1 -> 0L
                     else -> (holdUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
                 }
-                onTick(
-                    RotationTick(
-                        entry = entry,
-                        holding = holding,
-                        remainingMs = remaining,
-                        planSize = entries.size,
-                    ),
-                )
+                onTick(RotationTick(entry, holding, remaining, entries.size))
             }
-            handler.postDelayed(this, TICK_MS)
+            if (running) handler.postDelayed(this, TICK_MS)
         }
     }
 

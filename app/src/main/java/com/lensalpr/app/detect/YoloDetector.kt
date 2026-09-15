@@ -47,14 +47,15 @@ class Detection {
 class YoloDetector private constructor(
     private val env: OrtEnvironment,
     private val session: OrtSession,
+    private val sessionOptions: OrtSession.SessionOptions,
+    private val netBitmap: Bitmap,
     private val inputName: String,
     private val inputWidth: Int,
     private val inputHeight: Int,
     val backend: String,
 ) : Closeable {
 
-    private val netBitmap: Bitmap =
-        Bitmap.createBitmap(inputWidth, inputHeight, Bitmap.Config.ARGB_8888)
+    private var closed = false
     private val netCanvas = Canvas(netBitmap)
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val pixels = IntArray(inputWidth * inputHeight)
@@ -78,7 +79,9 @@ class YoloDetector private constructor(
      *
      * The returned list is owned by the detector and is valid until the next call.
      */
+    @Synchronized
     fun detect(frame: Bitmap, minScore: Float, minBoxPx: Int, classes: IntArray): List<Detection> {
+        check(!closed) { "Detector is closed" }
         val started = SystemClock.elapsedRealtimeNanos()
         val frameWidth = frame.width
         val frameHeight = frame.height
@@ -149,14 +152,18 @@ class YoloDetector private constructor(
         for (row in 0 until rows) {
             val offset = row * ROW_STRIDE
             val score = buffer.get(offset + 4)
-            if (score < minScore) continue
-            val classId = buffer.get(offset + 5).roundToInt()
+            if (!score.isFinite() || score < minScore) continue
+            val rawClass = buffer.get(offset + 5)
+            if (!rawClass.isFinite()) continue
+            val classId = rawClass.roundToInt()
             if (!classes.contains(classId)) continue
 
             val left = (buffer.get(offset) - padX) / scale
             val top = (buffer.get(offset + 1) - padY) / scale
             val right = (buffer.get(offset + 2) - padX) / scale
             val bottom = (buffer.get(offset + 3) - padY) / scale
+
+            if (!left.isFinite() || !top.isFinite() || !right.isFinite() || !bottom.isFinite()) continue
 
             val clampedLeft = max(0f, left)
             val clampedTop = max(0f, top)
@@ -180,9 +187,22 @@ class YoloDetector private constructor(
         return pool[index]
     }
 
+    @Synchronized
     override fun close() {
-        runCatching { session.close() }
-        runCatching { netBitmap.recycle() }
+        if (closed) return
+        // Options can own provider resources used by the session. Never close them first.
+        try {
+            session.close()
+        } catch (error: Exception) {
+            Log.w(TAG, "session close failed; retaining its options for retry", error)
+            return
+        }
+        closed = true
+        try {
+            sessionOptions.close()
+        } finally {
+            netBitmap.recycle()
+        }
     }
 
     companion object {
@@ -199,77 +219,94 @@ class YoloDetector private constructor(
         fun create(context: Context, config: ScanConfig): YoloDetector {
             val env = OrtEnvironment.getEnvironment()
             val modelFile = extractModel(context, config.model)
-            val options = OrtSession.SessionOptions()
-            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-            options.setMemoryPatternOptimization(true)
-
-            var backend = "cpu"
-            when (config.accelerator) {
-                Accelerator.NNAPI -> {
-                    val ok = runCatching { options.addNnapi() }.isSuccess
-                    backend = if (ok) "nnapi" else "cpu"
-                    options.setIntraOpNumThreads(config.detectorThreads)
+            val preferred = when (config.accelerator) {
+                Accelerator.NNAPI -> "nnapi"
+                Accelerator.XNNPACK -> "xnnpack"
+            }
+            val resources = try {
+                openSession(env, modelFile, config, preferred)
+            } catch (error: Exception) {
+                Log.w(TAG, "session creation failed on $preferred, falling back to CPU", error)
+                try {
+                    openSession(env, modelFile, config, "cpu")
+                } catch (fallback: Exception) {
+                    fallback.addSuppressed(error)
+                    throw fallback
                 }
+            }
+            var bitmap: Bitmap? = null
+            try {
+                val inputName = resources.session.inputNames.first()
+                bitmap = Bitmap.createBitmap(
+                    config.model.inputWidth, config.model.inputHeight, Bitmap.Config.ARGB_8888,
+                )
+                val detector = YoloDetector(
+                    env = env,
+                    session = resources.session,
+                    sessionOptions = resources.options,
+                    netBitmap = bitmap,
+                    inputName = inputName,
+                    inputWidth = config.model.inputWidth,
+                    inputHeight = config.model.inputHeight,
+                    backend = resources.backend,
+                )
+                Log.i(
+                    TAG,
+                    "Loaded ${config.model.asset} ${config.model.inputWidth}x${config.model.inputHeight} " +
+                        "backend=${resources.backend} threads=${config.detectorThreads} " +
+                        "outputs=${resources.session.outputNames}",
+                )
+                return detector
+            } catch (error: Throwable) {
+                runCatching { bitmap?.recycle() }.exceptionOrNull()?.let(error::addSuppressed)
+                try {
+                    resources.session.close()
+                    resources.options.close()
+                } catch (cleanup: Throwable) {
+                    error.addSuppressed(cleanup)
+                }
+                throw error
+            }
+        }
 
-                Accelerator.XNNPACK -> {
-                    val ok = runCatching {
-                        options.addXnnpack(
-                            mapOf("intra_op_num_threads" to config.detectorThreads.toString()),
-                        )
-                    }.isSuccess
-                    if (ok) {
-                        backend = "xnnpack"
-                        // XNNPACK owns its own thread pool; ORT must not spawn a second one.
-                        options.setIntraOpNumThreads(1)
-                    } else {
+        private data class SessionResources(
+            val session: OrtSession,
+            val options: OrtSession.SessionOptions,
+            val backend: String,
+        )
+
+        private fun openSession(
+            env: OrtEnvironment,
+            modelFile: File,
+            config: ScanConfig,
+            backend: String,
+        ): SessionResources {
+            val options = OrtSession.SessionOptions()
+            try {
+                options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
+                options.setMemoryPatternOptimization(true)
+                when (backend) {
+                    "nnapi" -> {
+                        options.addNnapi()
                         options.setIntraOpNumThreads(config.detectorThreads)
                     }
+                    "xnnpack" -> {
+                        options.addXnnpack(mapOf("intra_op_num_threads" to config.detectorThreads.toString()))
+                        options.setIntraOpNumThreads(1)
+                    }
+                    else -> options.setIntraOpNumThreads(config.detectorThreads)
                 }
+                return SessionResources(env.createSession(modelFile.absolutePath, options), options, backend)
+            } catch (error: Throwable) {
+                runCatching { options.close() }.exceptionOrNull()?.let(error::addSuppressed)
+                throw error
             }
-
-            val session = runCatching {
-                env.createSession(modelFile.absolutePath, options)
-            }.getOrElse { error ->
-                // A vendor accelerator can accept the options and then reject the graph; the CPU
-                // provider always works, and a slower detector beats no detector.
-                Log.w(TAG, "session creation failed on $backend, falling back to CPU", error)
-                backend = "cpu"
-                val plain = OrtSession.SessionOptions()
-                plain.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                plain.setIntraOpNumThreads(config.detectorThreads)
-                env.createSession(modelFile.absolutePath, plain)
-            }
-            val inputName = session.inputNames.first()
-            Log.i(
-                TAG,
-                "Loaded ${config.model.asset} ${config.model.inputWidth}x${config.model.inputHeight} " +
-                    "backend=$backend threads=${config.detectorThreads} outputs=${session.outputNames}",
-            )
-            return YoloDetector(
-                env = env,
-                session = session,
-                inputName = inputName,
-                inputWidth = config.model.inputWidth,
-                inputHeight = config.model.inputHeight,
-                backend = backend,
-            )
         }
 
-        /**
-         * ONNX Runtime maps the model from disk, so the asset is copied once into app storage
-         * instead of being held in the heap as a byte array.
-         */
-        private fun extractModel(context: Context, model: DetectorModel): File {
-            val target = File(context.filesDir, model.asset)
-            val expected = runCatching {
-                context.assets.openFd(model.asset).use { it.length }
-            }.getOrDefault(-1L)
-            if (target.exists() && (expected < 0L || target.length() == expected)) return target
-            context.assets.open(model.asset).use { input ->
-                target.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
+        private fun extractModel(context: Context, model: DetectorModel): File =
+            ModelAssetCache.materialize(File(context.filesDir, model.asset)) {
+                context.assets.open(model.asset)
             }
-            return target
-        }
     }
 }

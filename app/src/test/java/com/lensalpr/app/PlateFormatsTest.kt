@@ -44,9 +44,9 @@ class PlateFormatsTest {
 
     @Test
     fun `characters the layout leaves no choice about are repaired`() {
-        // O cannot stand inside the number block, I cannot either.
-        assertEquals("EM-7209", PlateFormats.parse("EM72O9")?.display)
-        assertTrue(PlateFormats.parse("EM72O9")?.corrected == true)
+        // Once the local format is explicit, repair OCR confusion inside its digit block.
+        assertEquals("EM-7209", PlateFormats.parse("EM72O9", strictLatvia = true)?.display)
+        assertTrue(PlateFormats.parse("EM72O9", strictLatvia = true)?.corrected == true)
         // A string that is already a valid layout is never touched: EMI-209 is a plate on its own.
         assertEquals("EMI-209", PlateFormats.parse("EMI209")?.display)
         assertTrue(PlateFormats.parse("EMI209")?.corrected == false)
@@ -60,5 +60,30 @@ class PlateFormatsTest {
         assertEquals("NY53NKD", uk?.key)
         assertTrue(uk?.latvian == false)
         assertNull(PlateFormats.parse("NY53NKD", strictLatvia = true))
+    }
+    @Test
+    fun `unknown and foreign identifiers are preserved rather than guessed`() {
+        assertEquals("GBB01B", PlateFormats.parse("GBB-01-B")?.key)
+        assertEquals("XX85TS", PlateFormats.parse("XX-85-TS")?.key)
+        assertEquals("EM72O9", PlateFormats.parse("EM72O9")?.key)
+        assertEquals("GBB01B", PlateFormats.parse("GBB-01-B", countryCode = "NL")?.key)
+        assertNull(PlateFormats.parse("GBB-01-B", strictLatvia = true, countryCode = "NL"))
+    }
+
+    @Test
+    fun `country evidence permits OCR correction without modifying human input`() {
+        assertEquals("EM7209", PlateFormats.parse("EM72O9", countryCode = "LV")?.key)
+        assertEquals("EM72O9", PlateFormats.key("EM72O9"))
+        assertEquals("GBB01B", PlateFormats.key("GBB-01-B"))
+        assertTrue(PlateFormats.key("GBB-018") != PlateFormats.key("GBB-01-B"))
+    }
+
+    @Test
+    fun `corrected signs never reappear through the generic fallback`() {
+        for (strict in listOf(false, true)) {
+            for (raw in listOf("P104", "P1O4", "RIGA12", "R1GA12")) {
+                assertNull("$raw strict=$strict", PlateFormats.parse(raw, strict))
+            }
+        }
     }
 }
