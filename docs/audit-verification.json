@@ -1,0 +1,145 @@
+{
+  "baseline_commit": "0389bc227d8911c141ed6dd530d25316f58b79f0",
+  "tested_code_commit": "07d8dc0689ce6be008a7ed73ef565083552e28a3",
+  "tested_tree_sha": "79dea1fb40d246df3dfebc07b4da7472fcd4a6a4",
+  "github_tree_reconstructed_from_tested_blob_hashes_matches": true,
+  "environment": {
+    "jdk": "OpenJDK 21.0.11",
+    "kotlinc": "1.9.0",
+    "android_sdk_available": false
+  },
+  "scope": "Production Kotlin sources with explicit Android, ORT, JSON and application-type doubles; not a Gradle/APK/device run",
+  "checks": {
+    "baseline": {
+      "session": [
+        3,
+        11
+      ],
+      "detector": [
+        2,
+        16
+      ],
+      "formats": [
+        9,
+        9
+      ],
+      "total": [
+        14,
+        36
+      ],
+      "exit_code": 1
+    },
+    "repaired": {
+      "session": [
+        14,
+        0
+      ],
+      "detector": [
+        18,
+        0
+      ],
+      "formats": [
+        18,
+        0
+      ],
+      "total": [
+        50,
+        0
+      ],
+      "exit_code": 0
+    }
+  },
+  "count_order": [
+    "passed",
+    "failed"
+  ],
+  "additional_static_checks": {
+    "manifest_TTS_query": true,
+    "manifest_permissions_and_application_preserved": true,
+    "gradlew_mode": "100755"
+  },
+  "source_entries": [
+    {
+      "path": ".github/workflows/android-verification.yml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "20eaa954018d919ef9baf12f0e32433d7a72b60f"
+    },
+    {
+      "path": "app/src/main/AndroidManifest.xml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "9d5b60bbba2f456c0fcf801349c72a099ebe362b"
+    },
+    {
+      "path": "app/src/main/java/com/lensalpr/app/ScanSessionService.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "1a03ee7c66c2b873730f7890d48662efcb97002a"
+    },
+    {
+      "path": "app/src/main/java/com/lensalpr/app/alpr/AlprResults.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "74f6b84859c0789e7af8938ee8118a7ec7f4bdce"
+    },
+    {
+      "path": "app/src/main/java/com/lensalpr/app/alpr/PlateFormats.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "851c72bdb54cbbbf84392442254e51d8ef2842f7"
+    },
+    {
+      "path": "app/src/main/java/com/lensalpr/app/camera/LensRotationScheduler.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "abf2ae758a8f2029b2346f2c86e0536c559d1b39"
+    },
+    {
+      "path": "app/src/main/java/com/lensalpr/app/detect/ModelAssetCache.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "cb17408086cc3384807b6cc5c8c0b0f973a391df"
+    },
+    {
+      "path": "app/src/main/java/com/lensalpr/app/detect/YoloDetector.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "f5abb7da89193dfdba65730943d2be98f5106d56"
+    },
+    {
+      "path": "app/src/test/java/com/lensalpr/app/PlateFormatsTest.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "a85af0c24ad5d714190dac880a554aa166bb58b9"
+    },
+    {
+      "path": "tools/host-tests/Checks.kt",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "2a374a4cb1ae32d26ab0dcad609292c728669756"
+    },
+    {
+      "path": "tools/host-tests/README.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "05ba37ad870acdd3a73227c3c6b1fc168d0ca829"
+    },
+    {
+      "path": "tools/host-tests/run.py",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "38d12aeccf61261fa846310de3a8f517d4ec5aee"
+    },
+    {
+      "path": "gradlew",
+      "mode": "100755",
+      "type": "blob",
+      "sha": "f5feea6d6b116baaca5a2642d4d9fa1f47d574a7"
+    }
+  ],
+  "log_sha256": {
+    "baseline.log": "b3fa0c636438f9d5377d108a973c1b9712124df93b9710cc44b7904dfb375630",
+    "fixed.log": "9f09b4249182a39960223af0ff6e523d882bbf7ea05efbc7dd3d3305a752fba5"
+  }
+}
