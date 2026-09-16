@@ -70,6 +70,13 @@
     <string name="level_blacklist">только чёрный список</string>
     <string name="location_required">Для детекта слежки нужен доступ к геолокации</string>
     <string name="action_blacklist">В чёрный список</string>
+    <string name="action_add_plate_short">⛔️ +</string>
+    <string name="add_plate_title">Добавить номер вручную</string>
+    <string name="add_plate_hint">Машина, которой камера ещё не видела. Работает без сети — бот не нужен.</string>
+    <string name="add_plate_field_hint">AB-1234</string>
+    <string name="action_add_blacklist">В чёрный список</string>
+    <string name="action_add_police">Полиция</string>
+    <string name="dialog_cancel_action">Отмена</string>
     <string name="action_ignore">Свой, не тревожить</string>
     <string name="action_unignore">Снова следить</string>
     <string name="action_unblacklist">Убрать из чёрного списка</string>

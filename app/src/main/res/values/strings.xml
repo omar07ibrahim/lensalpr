@@ -77,6 +77,13 @@
     <string name="action_blacklist">Blacklist</string>
     <string name="action_unblacklist">Remove from blacklist</string>
     <string name="blacklisted_toast">%1$s added to the blacklist</string>
+    <string name="action_add_plate_short">⛔️ +</string>
+    <string name="add_plate_title">Add a plate by hand</string>
+    <string name="add_plate_hint">A car not yet seen by the camera. Works without network — the bot is not needed.</string>
+    <string name="add_plate_field_hint">AB-1234</string>
+    <string name="action_add_blacklist">Blacklist</string>
+    <string name="action_add_police">Police</string>
+    <string name="dialog_cancel_action">Cancel</string>
     <string name="action_police">🚔 Mark as police</string>
     <string name="action_unpolice">🚔 Remove police mark</string>
     <string name="police_toast">%1$s marked as police</string>

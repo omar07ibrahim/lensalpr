@@ -454,6 +454,7 @@ class ScanActivity : AppCompatActivity() {
                 shareReport()
                 true
             }
+        binding.btnAddPlate.setOnClickListener { showAddPlateDialog() }
         binding.btnClear.setOnClickListener {
             registry.clear()
             evidenceByPlate.clear()
@@ -3557,6 +3558,43 @@ class ScanActivity : AppCompatActivity() {
             lastNotifiedBanner = null
             ScanSessionService.start(this, getString(R.string.service_running))
         }
+    }
+
+    // ---------------------------------------------------------------- manual lists
+
+    /**
+     * A plate typed in by hand, for a car the camera has not seen yet.
+     *
+     * The bot does this with `/bl`, and in airplane mode the bot is out of reach — which is
+     * exactly when the operator watches the blacklist most. Goes through the same host methods as
+     * the bot and the card dialog, so the mark lands in the database and the follow engine alike.
+     */
+    private fun showAddPlateDialog() {
+        val dialogBinding = com.lensalpr.app.databinding.DialogAddPlateBinding.inflate(layoutInflater)
+        fun typed(): String = dialogBinding.plateInput.text?.toString().orEmpty().trim()
+        fun apply(reply: String) {
+            Toast.makeText(this, reply.replace(Regex("<[^>]+>"), ""), Toast.LENGTH_LONG).show()
+            publishVehicles()
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.add_plate_title)
+            .setView(dialogBinding.root)
+            .setPositiveButton(R.string.action_add_blacklist) { _, _ -> apply(botHost.setBlacklist(typed(), true)) }
+            .setNeutralButton(R.string.action_add_police) { _, _ -> apply(botHost.setPolice(typed(), true)) }
+            .setNegativeButton(R.string.dialog_cancel_action, null)
+            .create()
+        dialogBinding.plateInput.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_DONE) {
+                apply(botHost.setBlacklist(typed(), true))
+                dialog.dismiss()
+                true
+            } else {
+                false
+            }
+        }
+        dialog.show()
+        dialogBinding.plateInput.requestFocus()
+        dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
     }
 
     // ---------------------------------------------------------------- airplane mode

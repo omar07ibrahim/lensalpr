@@ -208,6 +208,15 @@
                 android:textSize="14sp" />
 
             <Button
+                android:id="@+id/btnAddPlate"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:text="@string/action_add_plate_short"
+                android:textSize="12sp" />
+
+            <Button
                 android:id="@+id/btnClear"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
