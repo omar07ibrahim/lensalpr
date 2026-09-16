@@ -127,6 +127,14 @@ class FollowEngine(
         var lastOdometerM = 0.0
         var sightings = 0
 
+        /**
+         * The camera has read this plate — in this process or, for a restored row, in an earlier
+         * one. Only such a state may absorb a similar reading: a key the operator typed and nobody
+         * has ever seen is exact, and folding a neighbouring spelling into it would put the mark
+         * on somebody else's car.
+         */
+        var cameraConfirmed = false
+
         /** Contact banked from earlier stretches of company, excluding the gaps between them. */
         var contactMsBanked = 0L
         var contactMBanked = 0.0
@@ -437,9 +445,12 @@ class FollowEngine(
         io.execute {
             val plates = runCatching { store.policePlates() }.getOrDefault(emptySet())
             if (plates.isEmpty()) return@execute
+            val seen = runCatching { store.seenByCamera(plates) }.getOrDefault(emptySet())
             main.post {
                 plates.forEach { plate ->
-                    states.getOrPut(plate) { State(plate) }.police = true
+                    val state = states.getOrPut(plate) { State(plate) }
+                    state.police = true
+                    if (plate in seen) state.cameraConfirmed = true
                 }
             }
         }
@@ -491,6 +502,7 @@ class FollowEngine(
             target.police = target.police || state.police
             target.ignored = target.ignored || state.ignored
             target.follower = target.follower || state.follower
+            target.cameraConfirmed = target.cameraConfirmed || state.cameraConfirmed
             target.followerAtSeconds = maxOf(target.followerAtSeconds, state.followerAtSeconds)
             // Losing this meant the clip already running about the merged car would never be
             // recognised as running, and a second one would be started on top of it.
@@ -518,7 +530,11 @@ class FollowEngine(
             target.level = when {
                 target.ignored -> ThreatLevel.IGNORE
                 target.blacklisted -> ThreatLevel.BLACKLIST
-                else -> classify(target, System.currentTimeMillis())
+                // Never downwards, here as everywhere: a TAIL earned by "followed, vanished,
+                // came back" is not reproducible from the counters alone, and a merge that
+                // re-derived it dropped the card and then announced the same car as a fresh
+                // promotion on its next sighting.
+                else -> maxOf(classify(target, System.currentTimeMillis()), previousTargetLevel, state.level)
             }
             if (target.blacklisted) {
                 val key = target.storeKey
@@ -589,11 +605,13 @@ class FollowEngine(
         io.execute {
             val plates = runCatching { store.ignoredPlates() }.getOrDefault(emptySet())
             if (plates.isEmpty()) return@execute
+            val seen = runCatching { store.seenByCamera(plates) }.getOrDefault(emptySet())
             main.post {
                 plates.forEach { plate ->
                     val state = states.getOrPut(plate) { State(plate) }
                     state.ignored = true
                     state.level = ThreatLevel.IGNORE
+                    if (plate in seen) state.cameraConfirmed = true
                 }
             }
         }
@@ -632,6 +650,9 @@ class FollowEngine(
                     state.color = row.color
                 }
                 state.bestScore = maxOf(state.bestScore, row.bestScore)
+                // Read by the camera before the restart: a neighbouring spelling read today is
+                // this car, and the history below must land on it rather than on a fresh state.
+                if (row.sightings > 0) state.cameraConfirmed = true
                 state.sharedTurns = maxOf(state.sharedTurns, row.sharedTurns)
                 state.reacquisitions = maxOf(state.reacquisitions, row.reacquisitions)
                 // Banked, on top of whatever the live stretch has measured since the restart.
@@ -688,11 +709,13 @@ class FollowEngine(
         io.execute {
             val plates = runCatching { store.blacklistedPlates() }.getOrDefault(emptySet())
             if (plates.isEmpty()) return@execute
+            val seen = runCatching { store.seenByCamera(plates) }.getOrDefault(emptySet())
             main.post {
                 plates.forEach { plate ->
                     val state = states.getOrPut(plate) { State(plate) }
                     state.blacklisted = true
                     state.level = ThreatLevel.BLACKLIST
+                    if (plate in seen) state.cameraConfirmed = true
                 }
             }
         }
@@ -811,6 +834,7 @@ class FollowEngine(
         }
         state.sightings += 1
         state.segmentSightings += 1
+        state.cameraConfirmed = true
         if (key == plate) state.displayPlate = displayPlate
         state.lastLens = lens
         makeModel?.let { state.makeModel = it }
@@ -1063,7 +1087,7 @@ class FollowEngine(
     private fun canonicalKey(plate: String, score: Float): String {
         if (states.containsKey(plate)) return plate
         val similar = states.entries.firstOrNull { (key, state) ->
-            state.sightings > 0 && PlateSimilarity.similar(key, plate)
+            state.cameraConfirmed && PlateSimilarity.similar(key, plate)
         }?.key ?: return plate
         val existing = states[similar] ?: return plate
         if (PlateSimilarity.prefer(similar, existing.bestScore, plate, score)) {

@@ -70,6 +70,9 @@ class TripTracker(
 
     /** The last fix the odometer accepted; the base of the next measured step. */
     private var lastAccepted: Location? = null
+
+    /** When a fix last passed the accuracy gate, i.e. when distance was last actually measured. */
+    private var lastMeasuredMs = 0L
     private var lastBearing: Float? = null
 
     /** When [lastBearing] was measured; a heading from before a GPS outage is not a heading. */
@@ -113,16 +116,18 @@ class TripTracker(
     val hasOdometer: Boolean get() = running && current != null
 
     /**
-     * Whether distance is being measured *right now*: a fix newer than [maxAgeMs].
+     * Whether distance is being measured *right now*: a fix the odometer accepted, newer than
+     * [maxAgeMs].
      *
      * One fix at the start of the drive and nothing since is not an odometer; the follow engine
      * has to fall back to time and sightings again when the feed goes away, or a phone that lost
      * GPS in a tunnel spends the rest of the drive demanding kilometres that will never come.
+     * "Accepted" matters: in a tunnel or a garage the fused provider keeps delivering network
+     * fixes hundreds of metres wide, which [advanceOdometer] rightly ignores — counting them as
+     * measuring left the engine demanding distance from an odometer that stood still.
      */
-    fun hasFreshFix(nowMs: Long, maxAgeMs: Long): Boolean {
-        val fix = current ?: return false
-        return running && nowMs - fix.tMs <= maxAgeMs
-    }
+    fun hasFreshFix(nowMs: Long, maxAgeMs: Long): Boolean =
+        running && lastMeasuredMs != 0L && nowMs - lastMeasuredMs <= maxAgeMs
 
     private val callback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
@@ -159,6 +164,7 @@ class TripTracker(
         // belong to wherever the car went while nobody was measuring.
         forgetHeading()
         lastAccepted = null
+        lastMeasuredMs = 0L
     }
 
     /**
@@ -201,7 +207,7 @@ class TripTracker(
         // System.currentTimeMillis(), and a GNSS fix carrying a different notion of "now" would
         // silently shift every turn window.
         val now = System.currentTimeMillis()
-        advanceOdometer(location)
+        advanceOdometer(location, now)
 
         odometerSamples += now to odometerM
         if (odometerSamples.size > MAX_SAMPLES) odometerSamples.subList(0, 600).clear()
@@ -229,8 +235,9 @@ class TripTracker(
      * booked as 100 m driven; and at a crawl every 1 m step fell under the floor, so a kilometre of
      * traffic jam measured nothing at all.
      */
-    private fun advanceOdometer(location: Location) {
+    private fun advanceOdometer(location: Location, nowMs: Long) {
         if (location.accuracy >= MAX_ACCURACY_M) return
+        lastMeasuredMs = nowMs
         val base = lastAccepted
         if (base == null) {
             lastAccepted = location

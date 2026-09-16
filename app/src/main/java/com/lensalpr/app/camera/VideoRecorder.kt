@@ -29,11 +29,13 @@ import java.util.Locale
 class VideoRecorder(
     private val context: Context,
     /**
-     * A clip is complete. The last argument says the recorder stopped itself on a limit rather
+     * A clip is complete. The fourth argument says the recorder stopped itself on a limit rather
      * than being asked to — the subject is still behind us and filming has to carry on in a new
-     * file, exactly as when the session cuts a segment on time.
+     * file, exactly as when the session cuts a segment on time. The fifth says the camera was
+     * taken away underneath the clip (a rebind); the footage so far is kept, and the caller may
+     * start again once the camera is back.
      */
-    private val onFinished: (File, String, Long, Boolean) -> Unit,
+    private val onFinished: (File, String, Long, Boolean, Boolean) -> Unit,
     /** Nothing was written and there is no file. The caller must undo whatever it announced. */
     private val onFailed: (String, Int) -> Unit = { _, _ -> },
 ) {
@@ -143,13 +145,15 @@ class VideoRecorder(
                         startedAtMs = 0L
                         val usable = !event.hasError() || RECOVERABLE_ERRORS.contains(event.error)
                         val hitLimit = event.hasError() && LIMIT_ERRORS.contains(event.error)
+                        val sourceLost = event.hasError() &&
+                            event.error == VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE
                         // "Something was encoded" is the test, not an arbitrary byte count: a
                         // finalized three-second clip is a few tens of kilobytes and still evidence.
                         val bytes = runCatching { event.recordingStats.numBytesRecorded }.getOrDefault(0L)
                         val hasContent = (bytes > 0L || duration > 0L) && file.length() > MIN_USABLE_BYTES
                         if (usable && hasContent) {
                             if (event.hasError()) Log.w(TAG, "partial clip kept: ${event.error}")
-                            onFinished(file, plateForClip, duration, hitLimit)
+                            onFinished(file, plateForClip, duration, hitLimit, sourceLost)
                         } else {
                             // Only when there is genuinely nothing to keep. Evidence of a tail
                             // cannot be re-recorded, so a truncated clip beats no clip.

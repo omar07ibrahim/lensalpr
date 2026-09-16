@@ -167,7 +167,9 @@ object PlateFormats {
         val hintCode = countryCode?.trim()?.takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) }
         val hint = PlateRegion.fromCode(hintCode)
         // The engine named a country this scanner has no layouts for: never repaired into a local
-        // shape, and refused outright in strict mode.
+        // shape. A text that fits the configured layouts *exactly* still passes, strict or not — the
+        // country classifier mislabels local plates often enough that it must not veto a shape
+        // that is plainly local.
         val foreign = hintCode != null && hint == null
 
         if (strict) {

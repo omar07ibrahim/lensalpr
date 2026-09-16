@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.net.Uri
 import android.provider.Settings
 import android.util.Log
 import android.view.View
@@ -161,6 +162,25 @@ class ScanActivity : AppCompatActivity() {
 
     /** Puts the base banner back once a blacklist or police banner has had its time on screen. */
     private var markBannerRestore: Runnable? = null
+
+    /**
+     * When airplane mode was last switched off (uptime clock), or zero. The bot counts "unreachable
+     * since" from its last success, and the flight itself must not be billed as an outage.
+     */
+    private var airplaneOffAtMs = 0L
+
+    /**
+     * Until when a refused restart stays refused (uptime clock). The watchdogs that ask for one
+     * would otherwise announce the same stuck engine, and ask again, every couple of minutes.
+     */
+    private var restartRefusedUntilMs = 0L
+
+    /** Milliseconds the engine has actually spent answering crops since it last came up. */
+    private var engineBusyMs = 0L
+    private var engineBusyTickMs = 0L
+
+    /** Makes every spoken line its own utterance; a plate is spoken more than once per minute. */
+    private var utteranceSeq = 0L
 
     /**
      * When the current blind spell was first noticed. Recovery is only ever declared when a frame
@@ -390,6 +410,11 @@ class ScanActivity : AppCompatActivity() {
             minScore = config.minOcrScore.toFloat(),
             recognition = recognition,
         )
+        // A spelling the voters synthesise is validated the way every other read is — under the
+        // configured country's layouts, not the Latvian default.
+        registry.parsePlate = { text ->
+            com.lensalpr.app.alpr.PlateFormats.parse(text, config.strictPlateFormat, null, config.plateRegion)
+        }
         pool = CropBufferPool()
         spillStore = SpillStore(File(cacheDir, "spill")).apply {
             val carried = adopt()
@@ -628,15 +653,17 @@ class ScanActivity : AppCompatActivity() {
             engine.loadBlacklist()
             engine.loadPolice()
             engine.loadIgnored()
+            // Housekeeping first, restoration second: a state restored under a spelling the merge
+            // deletes a moment later would point at a row that no longer exists.
+            runCatching { store.prune(System.currentTimeMillis() - RETENTION_MS, id) }
+            runCatching { store.mergeDuplicates() }
+                .onSuccess { count -> if (count > 0) Log.i(TAG, "merged $count duplicate plates") }
             // What the engine knew before the restart lives in the database; without this the tail
             // that was being tracked a moment ago comes back as an unknown car with no history.
             runCatching { engine.hydrate(System.currentTimeMillis()) }
                 .onSuccess { count -> if (count > 0) Log.i(TAG, "restored $count vehicles from db") }
                 .onFailure { error -> Log.w(TAG, "hydrate failed", error) }
             if (resumed) Log.i(TAG, "resumed trip $id after process restart")
-            runCatching { store.prune(System.currentTimeMillis() - RETENTION_MS, id) }
-            runCatching { store.mergeDuplicates() }
-                .onSuccess { count -> if (count > 0) Log.i(TAG, "merged $count duplicate plates") }
         }
         if (!config.followEnabled) return
         if (hasLocationPermission()) {
@@ -792,8 +819,8 @@ class ScanActivity : AppCompatActivity() {
         bot?.broadcast("⚠️ Не удалось записать видео <code>${TelegramClient.escape(plate)}</code> (код $error)", urgent = true)
     }
 
-    private fun onClipFinished(file: File, plate: String, durationMs: Long, hitLimit: Boolean) {
-        Log.i(TAG, "clip ${file.name} ${durationMs / 1000}s ${file.length() / 1024}KB limit=$hitLimit")
+    private fun onClipFinished(file: File, plate: String, durationMs: Long, hitLimit: Boolean, sourceLost: Boolean) {
+        Log.i(TAG, "clip ${file.name} ${durationMs / 1000}s ${file.length() / 1024}KB limit=$hitLimit sourceLost=$sourceLost")
         mainHandler.post {
             // A clip the recorder ended itself, because the file filled up, is the same situation
             // as one the session cut on time: the subject is still there and filming must go on.
@@ -806,17 +833,26 @@ class ScanActivity : AppCompatActivity() {
             recordingStopRequested = false
             val subjectStillHere = manual || follow?.evidenceFor(plate) != null
             val allowed = sessionRunning && !destroyed && (manual || runtime.videoEnabled)
-            val continues = !stopped && allowed && (segmentPlate == plate || (hitLimit && subjectStillHere))
+            // A camera rebind (the stall watchdog, the blindness ladder) takes the use case away
+            // underneath the clip: the file is fine and the subject is still there, so filming
+            // goes on — after a moment, on the use case the rebind is about to create.
+            val continues = !stopped && allowed &&
+                (segmentPlate == plate || ((hitLimit || sourceLost) && subjectStillHere))
             segmentPlate = null
             if (continues) {
                 // Long tail: keep filming in a new file instead of one clip Telegram will refuse.
-                if (videoRecorder?.start(plate) != true) {
-                    hideBanner()
-                    manualRecording = false
-                    // The follow-up failed, so this car is no longer being filmed; say so, or it
-                    // would never be filmed again for the rest of the drive.
-                    follow?.noteVideoFinished(plate)
+                val restart = Runnable {
+                    if (destroyed) return@Runnable
+                    if (!sessionRunning || videoRecorder?.start(plate) != true) {
+                        hideBanner()
+                        manualRecording = false
+                        // The follow-up failed, so this car is no longer being filmed; say so, or
+                        // it would never be filmed again for the rest of the drive.
+                        follow?.noteVideoFinished(plate)
+                    }
+                    refreshRecordButton()
                 }
+                if (sourceLost) mainHandler.postDelayed(restart, SOURCE_LOST_RETRY_MS) else restart.run()
             } else {
                 hideBanner()
                 manualRecording = false
@@ -920,6 +956,9 @@ class ScanActivity : AppCompatActivity() {
      * the absence of results, hours later.
      */
     private fun reportPreviousCrash() {
+        // A session is running: the note's "tap to restart" has no job left, and tapping it
+        // hours later used to finish this very session.
+        CrashReporter.dismiss(this)
         ioExecutor.execute {
             val report = CrashReporter.peek(this) ?: return@execute
             Log.w(TAG, "previous session crashed: $report")
@@ -1311,9 +1350,12 @@ class ScanActivity : AppCompatActivity() {
      */
     private fun checkBotReachable() {
         val active = bot ?: return
-        // No network is the expected state of airplane mode, not a fault worth a sentence.
+        // No network is the expected state of airplane mode, not a fault worth a sentence — and
+        // the minutes spent in it are not counted against the link once it is back.
         if (airplaneMode) return
-        val down = active.unreachableForMs(SystemClock.elapsedRealtime())
+        val now = SystemClock.elapsedRealtime()
+        var down = active.unreachableForMs(now)
+        if (airplaneOffAtMs != 0L) down = minOf(down, now - airplaneOffAtMs)
         if (down < BOT_UNREACHABLE_LIMIT_MS) {
             if (botUnreachableTold) {
                 botUnreachableTold = false
@@ -1506,6 +1548,9 @@ class ScanActivity : AppCompatActivity() {
         stopRecording()
         controller?.let { lastControllerGeneration = it.currentGeneration }
         controller?.shutdown()
+        // The use case went away with the camera; a recorder still pointing at it would accept
+        // `/rec`, announce a clip and fail it a second later.
+        videoRecorder?.detach()
         tracker?.stop()
         // Through applyPause for the same reason as the resume side: one place decides what the
         // gate's paused flag means, so the two can never disagree about who paused what.
@@ -1516,10 +1561,10 @@ class ScanActivity : AppCompatActivity() {
     }
 
     /** Rebinds the camera and restarts the rotation with the same pipeline objects. */
-    private fun resumeSession() {
-        if (sessionRunning) return
-        val rearSetup = setup ?: return
-        val frameProcessor = processor ?: return
+    private fun resumeSession(): Boolean {
+        if (sessionRunning) return true
+        val rearSetup = setup ?: return false
+        val frameProcessor = processor ?: return false
         val recorder = videoRecorder ?: VideoRecorder(applicationContext, ::onClipFinished, ::onClipFailed)
             .also { videoRecorder = it }
 
@@ -1569,6 +1614,7 @@ class ScanActivity : AppCompatActivity() {
                 if (!destroyed && controller === camera && sessionRunning) rotation.start()
             }
         }
+        return true
     }
 
     private fun onGeoFix(fix: GeoFix) {
@@ -1730,6 +1776,14 @@ class ScanActivity : AppCompatActivity() {
             }
         }
     }
+
+    /**
+     * Two lines about the same car can sit in the queue together — a promotion and, seconds
+     * later, the meeting count. Keyed by plate alone the second overwrote the first, and when the
+     * first ended the queue looked empty: focus was given back and the music came up over the
+     * line still being spoken.
+     */
+    private fun utteranceIdFor(plate: String): String = "$plate#${utteranceSeq++}"
 
     /** One short spoken line. Used for events the driver must hear, not for per-car chatter. */
     private fun speak(text: String) {
@@ -1947,7 +2001,7 @@ class ScanActivity : AppCompatActivity() {
         if (reason == AlertReason.PRESENT) {
             val short = "$header. ${PlateSpeech.spell(evidence.displayPlate)}."
             // A reminder, not news: it never interrupts, it only fills a silence.
-            if (say(short, evidence.plate, VOICE_PRIORITY_REMINDER)) lastSpokenMs[evidence.plate] = now
+            if (say(short, utteranceIdFor(evidence.plate), VOICE_PRIORITY_REMINDER)) lastSpokenMs[evidence.plate] = now
             return
         }
         val line = buildString {
@@ -1977,7 +2031,7 @@ class ScanActivity : AppCompatActivity() {
         // A tail or a listed car outranks a merely suspicious one and the startup chatter, so it
         // cuts in rather than waiting behind them. It does not outrank another tail: see [say].
         // Marked as spoken only when the engine accepted the line.
-        if (say(line, evidence.plate, if (insistent) VOICE_PRIORITY_ALARM else VOICE_PRIORITY_NOTICE)) {
+        if (say(line, utteranceIdFor(evidence.plate), if (insistent) VOICE_PRIORITY_ALARM else VOICE_PRIORITY_NOTICE)) {
             lastSpokenMs[evidence.plate] = now
         }
     }
@@ -2135,6 +2189,11 @@ class ScanActivity : AppCompatActivity() {
             }.getOrDefault(0)
             if (undelivered > 0) append("⚠️ не отправлено клипов: $undelivered\n")
             append("${mark(battery)} батарея: ${if (battery) "без ограничений" else "оптимизация включена"}\n")
+            val overlay = runCatching { Settings.canDrawOverlays(this@ScanActivity) }.getOrDefault(false)
+            append(
+                "${mark(overlay)} самоперезапуск: " +
+                    if (overlay) "разрешён (поверх других приложений)\n" else "нет разрешения «поверх других приложений» — перезапуститься сам не смогу\n",
+            )
             bot?.problemText()?.let { problem -> append("⚠️ Telegram: $problem\n") }
             // Every reason the gate may be shut, not only the button: a stopped session and a
             // parked sleep used to be reported as "идёт" because the button had not been pressed.
@@ -2385,7 +2444,7 @@ class ScanActivity : AppCompatActivity() {
          */
         override fun setPolice(plate: String, police: Boolean): String {
             val parsed = com.lensalpr.app.alpr.PlateFormats.parse(plate)
-                ?: return "Не похоже на номер: $plate"
+                ?: return "Не похоже на номер: ${TelegramClient.escape(plate)}"
             val known = runCatching { store.isKnown(parsed.key) }.getOrDefault(true)
             // The engine writes the mark under the row the car actually lives in; a second write
             // under the typed spelling created a twin row whenever the two differed.
@@ -2421,7 +2480,7 @@ class ScanActivity : AppCompatActivity() {
 
         override fun setBlacklist(plate: String, blacklisted: Boolean): String {
             val parsed = com.lensalpr.app.alpr.PlateFormats.parse(plate)
-                ?: return "Не похоже на номер: $plate"
+                ?: return "Не похоже на номер: ${TelegramClient.escape(plate)}"
             // Read before the write is queued: the answer has to say whether this is a car the
             // camera actually knows, and the write itself happens on the io thread — by the
             // engine, under the row the car actually lives in.
@@ -2519,9 +2578,11 @@ class ScanActivity : AppCompatActivity() {
             if (destroyed) return@onMainSync "Сканер закрыт"
             if (running == sessionRunning) {
                 if (running) "Уже работает" else "Уже остановлено"
+            } else if (running) {
+                if (resumeSession()) "🟢 Запускаю сессию" else "⚠️ Не могу запустить: детектор ещё не готов, попробуй через несколько секунд"
             } else {
-                if (running) resumeSession() else haltSession()
-                if (running) "🟢 Запускаю сессию" else "🛑 Останавливаю сессию, камера освобождена"
+                haltSession()
+                "🛑 Останавливаю сессию, камера освобождена"
             }
         }
 
@@ -2658,7 +2719,7 @@ class ScanActivity : AppCompatActivity() {
 
         override fun setIgnored(plate: String, ignored: Boolean): String {
             val parsed = com.lensalpr.app.alpr.PlateFormats.parse(plate)
-                ?: return "Не похоже на номер: $plate"
+                ?: return "Не похоже на номер: ${TelegramClient.escape(plate)}"
             mainHandler.post {
                 follow?.setIgnored(parsed.key, ignored)
                 // A dismissed car must also stop filming right now, not after the next timeout —
@@ -2685,9 +2746,9 @@ class ScanActivity : AppCompatActivity() {
 
         override fun renamePlate(from: String, to: String): String {
             val source = com.lensalpr.app.alpr.PlateFormats.parse(from)
-                ?: return "Не похоже на номер: $from"
+                ?: return "Не похоже на номер: ${TelegramClient.escape(from)}"
             val target = com.lensalpr.app.alpr.PlateFormats.parse(to)
-                ?: return "Не похоже на номер: $to"
+                ?: return "Не похоже на номер: ${TelegramClient.escape(to)}"
             if (source.key == target.key) return "Это один и тот же номер"
             val renamed = runCatching {
                 store.renamePlateManually(source.key, target.key, target.display)
@@ -2975,10 +3036,7 @@ class ScanActivity : AppCompatActivity() {
             // limit comes back within seconds, the allowance is being counted per process and no
             // number of rebuilds will change that — so the attempt counter must survive the brief
             // READY in between, or the app would rebuild the engine forever and cook the phone.
-            val healthyFor = engineReadySinceMs
-                .takeIf { it != 0L }
-                ?.let { engineDownSinceMs - it }
-                ?: 0L
+            val healthyFor = if (engineReadySinceMs != 0L) engineBusyMs else 0L
             if (healthyFor >= ENGINE_HEALTHY_MS) {
                 engineRestarts = 0
                 engineGaveUp = false
@@ -3045,15 +3103,35 @@ class ScanActivity : AppCompatActivity() {
      * classifier starts inventing "two different trips" against every car still behind us; the
      * alarm is armed before the process dies because a dead process cannot start itself.
      */
-    private fun restartProcess(reason: String, spoken: String = "лимит движка ALPR") {
+    private fun restartProcess(reason: String, spoken: String = "лимит движка ALPR"): Boolean {
         if (isFinishing || isDestroyed) {
             Log.i(TAG, "restart cancelled: the activity is already going away")
-            return
+            return false
+        }
+        // One restart at a time: the stuck-engine and the blind ladders can both ask inside the
+        // same drain window, and each ask used to cost one of the three hourly attempts.
+        if (exitPending != null) return true
+        // Since Android 10 an app with no visible window may not start an activity, and the
+        // relaunch alarm fires after this process has killed itself. "Display over other apps"
+        // is the one exemption a sideloaded app can hold; without it the alarm is refused and
+        // the scanner stays dead until somebody looks — worse than staying up blind and saying so.
+        if (!runCatching { Settings.canDrawOverlays(this) }.getOrDefault(false)) {
+            Log.e(TAG, "no overlay permission: the relaunch would be blocked; staying up")
+            restartRefusedUntilMs = SystemClock.elapsedRealtime() + RESTART_WINDOW_MS
+            showBanner(getString(R.string.engine_runtime_limited_fatal))
+            bot?.broadcast(
+                "⚠️ Не могу перезапуститься сам: нет разрешения «поверх других приложений» " +
+                    "(экран настроек → кнопка). Остаюсь работать, распознавание сейчас не работает. " +
+                    "Причина: $spoken.",
+                urgent = true,
+            )
+            return false
         }
         val now = System.currentTimeMillis()
         val attempt = runtime.noteProcessRestart(now, RESTART_WINDOW_MS)
         if (attempt > MAX_PROCESS_RESTARTS) {
             Log.e(TAG, "refusing to restart: $attempt attempts within the hour")
+            restartRefusedUntilMs = SystemClock.elapsedRealtime() + RESTART_WINDOW_MS
             showBanner(getString(R.string.engine_runtime_limited_fatal))
             // Names the fault that actually ordered the restart. Saying "the engine licence" when
             // the real problem was a lens that would not verify sent the operator hunting in the
@@ -3063,28 +3141,32 @@ class ScanActivity : AppCompatActivity() {
                     "Причина: $spoken. Распознавание сейчас не работает.",
                 urgent = true,
             )
-            return
+            return false
         }
         Log.w(TAG, "restarting process ($attempt/$MAX_PROCESS_RESTARTS): $reason")
-        // Ownership of the trip moves to the process that is about to start — with its
-        // kilometres and turns, or the debrief describes only the part after the restart.
-        val trip = tripId
-        if (trip > 0L) runtime.handOverTrip(trip, tripStartMs, tracker?.odometerM ?: 0.0, tracker?.turnCount ?: 0)
 
-        // Finish the clip properly; a truncated MP4 is not evidence, it is a corrupt file.
-        stopRecording()
-
-        // The relaunch happens with nobody at the phone; it must get past the lock screen. An
-        // inexact alarm can fire minutes late, so the token outlives the nominal delay by a margin.
-        LockStore.armAutoUnlock(this, RESTART_ALARM_DELAY_MS + AUTO_UNLOCK_GRACE_MS)
         val intent = Intent(this, ScanActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        }
+        // The alarm is sent by the system with no launch privilege of its own; the creator's
+        // (this app's, through the overlay permission) must be attached explicitly, or the
+        // relaunch is judged as a plain background start and refused.
+        val options = if (android.os.Build.VERSION.SDK_INT >= 34) {
+            @Suppress("DEPRECATION")
+            android.app.ActivityOptions.makeBasic()
+                .setPendingIntentCreatorBackgroundActivityStartMode(
+                    android.app.ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED,
+                )
+                .toBundle()
+        } else {
+            null
         }
         val pending = PendingIntent.getActivity(
             this,
             RESTART_REQUEST_CODE,
             intent,
             PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            options,
         )
         val alarm = getSystemService(AlarmManager::class.java)
         val fireAt = SystemClock.elapsedRealtime() + RESTART_ALARM_DELAY_MS
@@ -3109,14 +3191,26 @@ class ScanActivity : AppCompatActivity() {
             // No alarm means no way back. A process that kills itself now stays dead until
             // somebody notices; staying up and blind is the lesser evil, and it is said so.
             Log.e(TAG, "no restart alarm could be armed; staying up instead of restarting")
+            restartRefusedUntilMs = SystemClock.elapsedRealtime() + RESTART_WINDOW_MS
             bot?.broadcast(
                 "⚠️ Не смог поставить будильник на перезапуск — приложение остаётся открытым, " +
                     "перезапусти его вручную. Причина: $spoken.",
                 urgent = true,
             )
-            return
+            return false
         }
         restartAlarm = pending
+        // Only now, with the way back secured: a handover, a lock-bypass token and a stopped clip
+        // are commitments to a restart, and were being made before it was known to be possible.
+        // Ownership of the trip moves to the process that is about to start — with its
+        // kilometres and turns, or the debrief describes only the part after the restart.
+        val trip = tripId
+        if (trip > 0L) runtime.handOverTrip(trip, tripStartMs, tracker?.odometerM ?: 0.0, tracker?.turnCount ?: 0)
+        // Finish the clip properly; a truncated MP4 is not evidence, it is a corrupt file.
+        stopRecording()
+        // The relaunch happens with nobody at the phone; it must get past the lock screen. An
+        // inexact alarm can fire minutes late, so the token outlives the nominal delay by a margin.
+        LockStore.armAutoUnlock(this, RESTART_ALARM_DELAY_MS + AUTO_UNLOCK_GRACE_MS)
 
         // Give the recorder time to write the MP4 index and the bot time to flush its queue, then
         // go. The alarm above is what brings the app back. Held in a field so that closing the
@@ -3146,12 +3240,15 @@ class ScanActivity : AppCompatActivity() {
         }
         exitPending = exit
         mainHandler.postDelayed(exit, RESTART_DRAIN_MS)
+        return true
     }
 
     /** The engine is recognizing again; close the outage and say so where it will be read. */
     private fun onEngineRecovered() {
         val now = SystemClock.elapsedRealtime()
         engineReadySinceMs = now
+        engineBusyMs = 0L
+        engineBusyTickMs = now
         lastRecycleMs = now
         engineErrorRetries = 0
         if (engineDownSinceMs == 0L) return
@@ -3200,6 +3297,9 @@ class ScanActivity : AppCompatActivity() {
             return
         }
         if (ocrStuckSinceMs == 0L) {
+            // Already asked for a restart and been refused: the banner is up, the chat knows,
+            // and repeating both every ninety seconds helps nobody.
+            if (now < restartRefusedUntilMs) return
             ocrStuckSinceMs = now
             Log.e(TAG, "engine has been inside one crop for ${(now - since) / 1000}s")
             showBanner("🛑 Движок ALPR завис на одном кадре")
@@ -3232,18 +3332,25 @@ class ScanActivity : AppCompatActivity() {
         // "prove" itself without reading a single plate. The clock only runs while the engine has
         // actually answered a crop recently; frames passing the gate prove nothing about it.
         val engineWorking = now - worker.lastProcessedAtMs < TRACK_COUNT_FRESH_MS
-        if (engineReadySinceMs != 0L && !engineWorking) engineReadySinceMs = now
+        // Accumulated, not restarted: resetting the clock on every idle gap measured the last
+        // uninterrupted busy stretch, so an engine that had read plates for an hour with a red
+        // light in between "survived only seconds" and the restart budget ratcheted towards a
+        // process restart it had never earned.
+        if (engineReadySinceMs != 0L && engineWorking && engineBusyTickMs != 0L) {
+            engineBusyMs += (now - engineBusyTickMs).coerceIn(0L, WATCHDOG_INTERVAL_MS * 2)
+        }
+        engineBusyTickMs = now
 
         // A periodic knock that finally stuck. Announced here rather than the moment the engine
         // reports READY, because in this state it reports READY every five minutes and dies on the
         // next frame — only running for a while is proof.
         if (engineGaveUp && status.isReady && engineReadySinceMs != 0L &&
-            now - engineReadySinceMs >= ENGINE_HEALTHY_MS
+            engineBusyMs >= ENGINE_HEALTHY_MS
         ) {
             engineGaveUp = false
             engineRestarts = 0
             bot?.broadcast(
-                "✅ Движок ALPR держится ${(now - engineReadySinceMs) / 60_000} мин — " +
+                "✅ Движок ALPR держится ${engineBusyMs / 60_000} мин работы — " +
                     "читаю номера снова",
                 urgent = true,
             )
@@ -3307,6 +3414,7 @@ class ScanActivity : AppCompatActivity() {
             if (engineInitSinceMs == 0L) engineInitSinceMs = now
             if (now - engineInitSinceMs > ENGINE_INIT_TIMEOUT_MS) {
                 engineInitSinceMs = now
+                if (now < restartRefusedUntilMs) return
                 Log.e(TAG, "engine stuck in INITIALIZING; restarting the process")
                 bot?.broadcast(
                     "⛔️ Движок ALPR завис на запуске. Перезапускаю приложение.",
@@ -3497,6 +3605,7 @@ class ScanActivity : AppCompatActivity() {
             showBanner(getString(R.string.airplane_banner))
             if (announce) speak("Режим самолёта. Слежу только за чёрным списком и полицией.")
         } else {
+            airplaneOffAtMs = SystemClock.elapsedRealtime()
             if (lastNotifiedBanner == getString(R.string.airplane_banner)) hideBanner()
             if (announce) speak("Режим самолёта выключен. Обычный режим.")
         }
@@ -3959,6 +4068,9 @@ class ScanActivity : AppCompatActivity() {
 
         /** How long a blacklist or police banner keeps the screen before the base banner returns. */
         const val MARK_BANNER_MS = 30_000L
+
+        /** How long after a rebind took the camera away before the clip is started again on the new one. */
+        const val SOURCE_LOST_RETRY_MS = 1_500L
 
         /**
          * Process restarts allowed inside [RESTART_WINDOW_MS].

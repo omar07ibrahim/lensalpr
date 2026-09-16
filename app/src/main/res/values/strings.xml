@@ -84,6 +84,8 @@
     <string name="start_scan">START SCANNING</string>
     <string name="permission_required">Camera permission is required to enumerate the physical lenses.</string>
     <string name="grant_permission">Grant camera permission</string>
+    <string name="overlay_required">To restart itself unattended the scanner needs "Display over other apps"; without it a self-restart is refused by Android and the app stays blind instead.</string>
+    <string name="grant_overlay">Allow display over other apps</string>
     <string name="no_lens_selected">Enable at least one zoom step</string>
     <string name="hardware_summary">%1$s · %2$d rear modules found</string>
     <string name="reset_defaults">Reset to defaults</string>

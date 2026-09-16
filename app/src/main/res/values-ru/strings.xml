@@ -81,6 +81,8 @@
     <string name="start_scan">НАЧАТЬ СКАНИРОВАНИЕ</string>
     <string name="permission_required">Нужен доступ к камере, чтобы найти физические линзы.</string>
     <string name="grant_permission">Разрешить доступ к камере</string>
+    <string name="overlay_required">Чтобы перезапускать себя без человека, сканеру нужно разрешение «Поверх других приложений»; без него Android отказывает в перезапуске, и приложение остаётся работать вслепую.</string>
+    <string name="grant_overlay">Разрешить показ поверх других приложений</string>
     <string name="no_lens_selected">Включите хотя бы один шаг зума</string>
     <string name="hardware_summary">%1$s · найдено задних модулей: %2$d</string>
     <string name="reset_defaults">Сбросить настройки</string>

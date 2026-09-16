@@ -75,6 +75,32 @@
                     android:text="@string/grant_permission" />
             </LinearLayout>
 
+            <LinearLayout
+                android:id="@+id/overlayCard"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/bg_section"
+                android:orientation="vertical"
+                android:padding="14dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/overlay_required"
+                    android:textColor="@color/warn"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/overlayButton"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/grant_overlay" />
+            </LinearLayout>
+
             <!-- Lens rotation plan -->
             <LinearLayout
                 android:layout_width="match_parent"

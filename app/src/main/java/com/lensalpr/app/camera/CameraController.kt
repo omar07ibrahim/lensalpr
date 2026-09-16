@@ -156,6 +156,9 @@ class CameraController(
         verifier.retarget(step, generation, PhysicalLensRoutingPolicy.controlZoomRatio(route, step))
         publishState(step)
 
+        // Posted before the bind: a session that fails to bind must still leave the verifier in
+        // a terminal state, not "verifying" forever on a camera that is not there.
+        mainHandler.postDelayed({ if (!closed) verifier.checkTimeout() }, verifier.timeoutMs + 150L)
         if (needsRebind && !bind(provider, step, route)) {
             // Nothing is bound: there is no camera to zoom and no metadata to wait for. Settle the
             // step so the rotation keeps moving; the stall watchdog will ask for another rebind.
@@ -164,7 +167,6 @@ class CameraController(
         }
         applyZoom(step, route, generation)
 
-        mainHandler.postDelayed({ if (!closed) verifier.checkTimeout() }, verifier.timeoutMs + 150L)
         // A HAL that answers with steady metadata still needs a moment to settle the crop; a hard
         // ceiling keeps the rotation moving even when no terminal verification state arrives.
         mainHandler.postDelayed({ settle(generation, force = true) }, SETTLE_CEILING_MS)

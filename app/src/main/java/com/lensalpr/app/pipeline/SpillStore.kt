@@ -51,6 +51,13 @@ class SpillStore(private val dir: File, private val maxFiles: Int = 600, private
 
     private val sequence = AtomicInteger(0)
 
+    /**
+     * Stamped into every crop this store writes. A crop carrying another token was written by a
+     * previous run — possibly *after* this run adopted the directory, by the old writer draining
+     * its queue — and its track id belongs to a tracker that no longer exists.
+     */
+    private val runToken = System.nanoTime()
+
     /** Highest index written by a previous run; everything up to it is carried over. */
     private val carriedCeiling = AtomicInteger(-1)
     private val queued = AtomicInteger(0)
@@ -129,6 +136,7 @@ class SpillStore(private val dir: File, private val maxFiles: Int = 600, private
             }
 
             val meta = JSONObject()
+                .put("run", runToken)
                 .put("track", job.trackId)
                 .put("t", job.submittedAtMs)
                 .put("lens", job.lensLabel)
@@ -200,7 +208,7 @@ class SpillStore(private val dir: File, private val maxFiles: Int = 600, private
                 // follow engine cannot detect: it reads as "this car travelled nowhere with us".
                 odometerM = if (meta.has("odo")) meta.optDouble("odo", Double.NaN) else Double.NaN,
                 narrow = meta.optBoolean("narrow", false),
-                carriedOver = index <= carriedCeiling.get(),
+                carriedOver = index <= carriedCeiling.get() || meta.optLong("run", 0L) != runToken,
             )
         }.getOrNull()
 

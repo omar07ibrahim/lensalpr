@@ -24,6 +24,13 @@
       the service gets killed an hour into a drive with no explanation.
     -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!--
+      Since Android 10 an app with no visible window may not start an activity — and that is
+      exactly what the self-restart does: the process kills itself and an alarm brings the
+      scanner back. The one exemption a sideloaded app can hold is "display over other apps";
+      without it the relaunch is refused and the scanner stays dead until somebody looks.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <uses-feature
         android:name="android.hardware.camera.any"

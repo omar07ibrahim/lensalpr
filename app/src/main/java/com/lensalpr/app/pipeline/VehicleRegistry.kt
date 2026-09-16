@@ -3,6 +3,7 @@ package com.lensalpr.app.pipeline
 import android.graphics.Bitmap
 import com.lensalpr.app.alpr.AlprOutcome
 import com.lensalpr.app.alpr.CarInfo
+import com.lensalpr.app.alpr.PlateFormats
 import com.lensalpr.app.alpr.PlateFusion
 import com.lensalpr.app.alpr.PlateReading
 import com.lensalpr.app.alpr.PlateSimilarity
@@ -44,7 +45,9 @@ data class VehicleCard(
  * Turns a stream of noisy per-crop readings into confirmed vehicles.
  *
  * A single OCR hit is never trusted: a plate is published only after the same normalized string has
- * been read [requiredMatches] times for the same tracked vehicle. Until then the track carries a
+ * been read [requiredMatches] times for the same tracked vehicle — reads one OCR confusion apart
+ * count as the same plate, and the group's best-supported spelling is what gets published (see
+ * [PlateFusion]). Until then the track carries a
  * visible "pending" candidate so the operator can see the engine converging.
  *
  * Confirmed plates are deduplicated globally, which matters with a rotating lens plan: the same car
@@ -69,6 +72,12 @@ class VehicleRegistry(
     var priority: (String) -> Boolean = { false }
 
     private fun requiredFor(plate: String): Int = if (priority(plate)) 1 else requiredMatches
+
+    /**
+     * How a spelling the voters synthesised is validated and formatted; set from the scan
+     * configuration so a fused Lithuanian plate is shown as one, not in the Latvian default.
+     */
+    var parsePlate: (String) -> PlateFormats.Plate? = { PlateFormats.parse(it) }
 
     /**
      * The change plus the affected card, so callers do not have to search the snapshot.
@@ -177,7 +186,7 @@ class VehicleRegistry(
         if (history.size > PlateFusion.MAX_READINGS) history.removeAt(0)
         // Reads of one car disagree one character at a time; letting them vote turns three
         // imperfect reads into the plate none of them got right on its own.
-        val fused = PlateFusion.fuse(history)
+        val fused = PlateFusion.fuse(history, parsePlate)
         val winner = fused?.reading ?: reading
         // Evidence means reads that actually back this spelling, not reads of this car in general:
         // otherwise one hallucinated character inherits the weight of every good read before it.
@@ -217,9 +226,9 @@ class VehicleRegistry(
             return SubmitResult(Change.PENDING, null, reading.recognitionScore)
         }
 
-        // Confirmed.
+        // Confirmed. The better-scored frame becomes the card's picture; the frame just read is
+        // the evidence frame whatever its score, so it is never the one freed here.
         val thumbnail = if (betterFrame) job.thumbnail else state.candidateThumb ?: job.thumbnail
-        if (thumbnail !== job.thumbnail) recycle(job.thumbnail)
         if (thumbnail !== state.candidateThumb) recycle(state.candidateThumb)
         state.candidateThumb = null
 
@@ -239,11 +248,14 @@ class VehicleRegistry(
             if (renamed || winner.recognitionScore > existing.ocrScore) {
                 existing.ocrScore = winner.recognitionScore
                 existing.thumbnail = thumbnail
+            } else if (thumbnail !== job.thumbnail) {
+                // The better-scored candidate improved no card; only the newest frame is published.
+                recycle(thumbnail)
             }
             // Always the newest frame, and therefore published: it may be handed to the evidence
             // writer on another thread, so it must not be recycled here. The frame it replaces
             // goes to the GC, following the same rule as every other published bitmap.
-            existing.latestThumbnail = thumbnail
+            existing.latestThumbnail = job.thumbnail
             applyAttributes(existing, state.car ?: winner.car)
             state.confirmed = existing.plate
             runtime.confirmedPlate = existing.plate
@@ -253,6 +265,7 @@ class VehicleRegistry(
         state.confirmed = winner.text
         runtime.confirmedPlate = winner.text
         val entry = createEntry(winner, state.car ?: winner.car, thumbnail, job.lensLabel, nowMs, votes)
+        entry.latestThumbnail = job.thumbnail
         trim()
         return SubmitResult(Change.CONFIRMED, entry.toCard(), reading.recognitionScore)
     }
@@ -271,6 +284,10 @@ class VehicleRegistry(
      * live vehicle has to meet.
      */
     private fun submitOrphan(job: OcrJob, outcome: AlprOutcome, nowMs: Long): SubmitResult {
+        // Parked votes age out here as well as on the live path: on an empty road nothing live
+        // arrives to prune them, and a crop read hours later must not confirm a card on the
+        // strength of one vote from the previous lens change.
+        prunePool(nowMs)
         val reading = selectReading(outcome, minScore, job)
         if (reading == null) {
             recycle(job.thumbnail)
@@ -307,7 +324,7 @@ class VehicleRegistry(
             val history = parked.state.variants.getOrPut(label) { ArrayList(PlateFusion.MAX_READINGS) }
             history += reading
             if (history.size > PlateFusion.MAX_READINGS) history.removeAt(0)
-            val fused = PlateFusion.fuse(history)
+            val fused = PlateFusion.fuse(history, parsePlate)
             val winner = fused?.reading ?: reading
             val betterFrame = reading.recognitionScore >= parked.state.bestScore
             if (count < requiredFor(winner.text)) {
@@ -525,9 +542,17 @@ class VehicleRegistry(
                 state.confirmed = to
                 // The old spelling's votes would re-confirm it on the next read; they now stand
                 // behind the corrected one.
-                val moved = state.counts.remove(from)
-                if (moved != null) state.counts[to] = maxOf(moved, state.counts[to] ?: 0)
-                state.variants.remove(from)?.let { history -> state.variants.getOrPut(to) { ArrayList() }.addAll(history) }
+                // The votes live under the group's first spelling, which is not necessarily the
+                // card's: find the group by similarity, or the move is a no-op and the old
+                // spelling re-confirms itself on the very next read.
+                val groupKey = state.counts.keys.firstOrNull { it == from || PlateSimilarity.similar(it, from) }
+                if (groupKey != null) {
+                    val moved = state.counts.remove(groupKey) ?: 0
+                    state.counts[to] = maxOf(moved, state.counts[to] ?: 0)
+                    state.variants.remove(groupKey)?.let { history ->
+                        state.variants.getOrPut(to) { ArrayList() }.addAll(history)
+                    }
+                }
             }
         }
         recognition.forEach { _, runtime ->
@@ -632,7 +657,9 @@ class VehicleRegistry(
         }
         entry.plate = reading.text
         entry.displayPlate = reading.display
-        entry.votes = votes
+        // A card the operator corrected keeps its authority through a merge, or the next strong
+        // run of reads could rename it straight back.
+        entry.votes = maxOf(votes, collision?.votes ?: 0)
         vehicles[entry.plate] = entry
         rekeyLiveTracks(previous, entry.plate)
         return true

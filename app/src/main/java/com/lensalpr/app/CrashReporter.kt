@@ -72,8 +72,13 @@ object CrashReporter {
         val restart = PendingIntent.getActivity(
             context,
             0,
+            // SINGLE_TOP as well: without it a tap on a stale note, hours into a new session,
+            // finished the running scanner and started it over — trip, clip and bot included.
             Intent(context, ScanActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                .addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                ),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val notification: Notification = NotificationCompat.Builder(context, CHANNEL)
@@ -85,6 +90,13 @@ object CrashReporter {
             .setContentIntent(restart)
             .build()
         manager.notify(NOTIFICATION_ID, notification)
+    }
+
+    /** Takes the note off the shade: a session is running, so the tap it offered has no job left. */
+    fun dismiss(context: Context) {
+        runCatching {
+            context.applicationContext.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+        }
     }
 
     /** The report left by a previous run, if any. Kept on disk until [clear] confirms delivery. */

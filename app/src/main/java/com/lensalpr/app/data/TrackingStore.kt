@@ -449,11 +449,15 @@ class TrackingStore(context: Context) {
             // instead of creating a twin, or keep the better read and rename the old row.
             val plate = canonicalPlate(plate, displayPlate, ocrScore)
             // The running encounter is this trip's: a new drive that meets the same car within
-            // three minutes of the old one ending is a second meeting, not a continuation.
+            // three minutes of the old one ending is a second meeting, not a continuation. And it
+            // is the encounter whose *span* contains the read, not merely the latest one: a crop
+            // recovered from disk arrives minutes after it was taken, and measured against the
+            // latest end alone it opened a second encounter inside the one still running.
             val existing = database.rawQuery(
                 "SELECT id, ended_at, photo_score, photo FROM encounters " +
-                    "WHERE plate = ? AND trip_id = ? ORDER BY ended_at DESC LIMIT 1",
-                arrayOf(plate, tripId.toString()),
+                    "WHERE plate = ? AND trip_id = ? AND ? <= ended_at + $ENCOUNTER_GAP_MS " +
+                    "AND ? >= started_at - $ENCOUNTER_GAP_MS ORDER BY ended_at DESC LIMIT 1",
+                arrayOf(plate, tripId.toString(), tMs.toString(), tMs.toString()),
             ).use { cursor ->
                 if (cursor.moveToFirst()) {
                     OpenEncounter(
@@ -467,7 +471,7 @@ class TrackingStore(context: Context) {
                 }
             }
 
-            val running = existing?.takeIf { kotlin.math.abs(tMs - it.endedAt) <= ENCOUNTER_GAP_MS }
+            val running = existing
             val encounterId: Long
             var newEncounter = false
             val wantsPhoto: Boolean
@@ -873,6 +877,17 @@ class TrackingStore(context: Context) {
         null,
     ).use { cursor ->
         buildList { while (cursor.moveToNext()) add(cursor.toVehicle()) }
+    }
+
+    /** Which of [plates] the camera has actually read, as opposed to rows the operator typed in. */
+    fun seenByCamera(plates: Collection<String>): Set<String> {
+        if (plates.isEmpty()) return emptySet()
+        return plates.chunked(400).flatMapTo(HashSet()) { chunk ->
+            db.rawQuery(
+                "SELECT plate FROM vehicles WHERE sightings > 0 AND plate IN (${chunk.joinToString(",") { "?" }})",
+                chunk.toTypedArray(),
+            ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(0)) } }
+        }
     }
 
     fun blacklistedPlates(): Set<String> = db.rawQuery(

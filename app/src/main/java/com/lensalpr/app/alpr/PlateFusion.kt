@@ -31,7 +31,10 @@ object PlateFusion {
      * Returns the reading the group agrees on, or the best single read when there is nothing to
      * fuse. [readings] must already be near-identical (see [PlateSimilarity.similar]).
      */
-    fun fuse(readings: List<PlateReading>): Fused? {
+    fun fuse(
+        readings: List<PlateReading>,
+        parse: (String) -> PlateFormats.Plate? = { PlateFormats.parse(it) },
+    ): Fused? {
         if (readings.isEmpty()) return null
         val best = readings.maxByOrNull { it.recognitionScore } ?: return null
         if (readings.size == 1) return Fused(best, 1)
@@ -95,7 +98,7 @@ object PlateFusion {
         val text = fused.toString()
         if (text == leader.text) return Fused(leader, supportFor(text, readings))
 
-        val plate = PlateFormats.parse(text) ?: return Fused(leader, supportFor(leader.text, readings))
+        val plate = parse(text) ?: return Fused(leader, supportFor(leader.text, readings))
         // The plate carries the confidence of the reads that actually said it. When the fusion is a
         // synthesis nobody produced on its own it carries the average of the reads behind it —
         // never the score of the spelling that was outvoted.

@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.widget.SeekBar
@@ -86,6 +88,13 @@ class SetupActivity : AppCompatActivity() {
 
         binding.permissionButton.setOnClickListener {
             permissionLauncher.launch(requiredPermissions)
+        }
+        binding.overlayButton.setOnClickListener {
+            runCatching {
+                startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
+                )
+            }.onFailure { Toast.makeText(this, R.string.overlay_required, Toast.LENGTH_LONG).show() }
         }
         binding.btnTelegramTest.setOnClickListener { testTelegram() }
         binding.btnReset.setOnClickListener {
@@ -184,7 +193,19 @@ class SetupActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        refresh()
+        // Only the permission card. Re-binding every control from the saved preferences here
+        // silently threw away whatever the operator had changed but not yet started with — the
+        // permission dialog alone pauses and resumes this screen.
+        refreshPermissions()
+        if (setup == null) refresh()
+    }
+
+    private fun refreshPermissions() {
+        val granted = hasCameraPermission()
+        binding.permissionCard.visibility = if (granted) android.view.View.GONE else android.view.View.VISIBLE
+        binding.btnStart.isEnabled = granted
+        val overlay = runCatching { Settings.canDrawOverlays(this) }.getOrDefault(true)
+        binding.overlayCard.visibility = if (overlay) android.view.View.GONE else android.view.View.VISIBLE
     }
 
     private fun hasCameraPermission(): Boolean = ContextCompat.checkSelfPermission(
@@ -198,9 +219,7 @@ class SetupActivity : AppCompatActivity() {
     ) == PackageManager.PERMISSION_GRANTED
 
     private fun refresh() {
-        val granted = hasCameraPermission()
-        binding.permissionCard.visibility = if (granted) android.view.View.GONE else android.view.View.VISIBLE
-        binding.btnStart.isEnabled = granted
+        refreshPermissions()
 
         val discovered = setup ?: CameraCatalog.discover(this)?.also { setup = it }
         val loaded = ScanConfig.load(this, discovered)
