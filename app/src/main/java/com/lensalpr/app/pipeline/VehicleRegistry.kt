@@ -63,8 +63,8 @@ class VehicleRegistry(
 
     /**
      * Plates that confirm on their first exact read instead of waiting for [requiredMatches]:
-     * the operator's blacklist and police list while the phone is in airplane mode, where being
-     * told a second earlier is the whole point. Read on the main thread, like everything here.
+     * the operator's blacklist and police list, in every mode — being told a second earlier is
+     * the whole point of those lists. Read on the main thread, like everything here.
      */
     var priority: (String) -> Boolean = { false }
 

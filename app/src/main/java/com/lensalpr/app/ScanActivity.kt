@@ -3458,9 +3458,13 @@ class ScanActivity : AppCompatActivity() {
      *
      * The scanner keeps recognizing and recording every car, but the route classifier is paused
      * — every verdict it could reach would rest on evidence that is not being collected — and the
-     * attention goes to the two lists the operator wrote by hand: a car on the blacklist or the
-     * police list is confirmed on its first exact read instead of waiting for consensus, and
-     * shouted at once. The phone also stops complaining about a Telegram it cannot reach.
+     * attention goes to the two lists the operator wrote by hand. The phone also stops
+     * complaining about a Telegram it cannot reach.
+     *
+     * A car on the blacklist or the police list is confirmed on its first exact read instead of
+     * waiting for consensus in *every* mode, not only here: the operator asked for the alarm the
+     * moment such a plate is read, and an exact match against a hand-written list is not the kind
+     * of read that consensus exists to protect against.
      */
     private fun watchAirplaneMode() {
         val receiver = object : BroadcastReceiver() {
@@ -3475,7 +3479,7 @@ class ScanActivity : AppCompatActivity() {
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
         airplaneReceiver = receiver
-        registry.priority = { plate -> airplaneMode && follow?.isMarked(plate) == true }
+        registry.priority = { plate -> follow?.isMarked(plate) == true }
         applyAirplaneMode(isAirplaneModeOn(), announce = false)
     }
 
