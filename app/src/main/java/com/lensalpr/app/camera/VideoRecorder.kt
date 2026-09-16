@@ -2,6 +2,7 @@ package com.lensalpr.app.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
@@ -45,6 +46,7 @@ class VideoRecorder(
     @Volatile
     private var target: String? = null
 
+    /** Monotonic: a clock correction mid-clip must not turn into a negative or hour-long clip. */
     @Volatile
     private var startedAtMs = 0L
 
@@ -58,10 +60,11 @@ class VideoRecorder(
     val currentTarget: String? get() = target
 
     val elapsedMs: Long
-        get() = if (startedAtMs == 0L) 0L else System.currentTimeMillis() - startedAtMs
+        get() = if (startedAtMs == 0L) 0L else SystemClock.elapsedRealtime() - startedAtMs
 
     /** Builds the use case to bind next to Preview and ImageAnalysis. */
-    fun buildUseCase(): VideoCapture<Recorder> {
+    @SuppressLint("RestrictedApi")
+    fun buildUseCase(targetRotation: Int): VideoCapture<Recorder> {
         val recorder = Recorder.Builder()
             // Ordered rather than a bare `from(HD)`: a single unsupported quality leaves the
             // selector with nothing and the device picks whatever it likes — which on this phone
@@ -85,6 +88,7 @@ class VideoRecorder(
             .setRequiredFreeStorageBytes(MAX_CLIP_BYTES + 16L * 1024 * 1024)
             .build()
         val capture = VideoCapture.withOutput(recorder)
+        capture.targetRotation = targetRotation
         videoCapture = capture
         return capture
     }
@@ -92,6 +96,14 @@ class VideoRecorder(
     fun detach() {
         stop()
         videoCapture = null
+    }
+
+    /**
+     * The clip's subject was renamed while it was being written. The file keeps its name; what
+     * changes is the key the absence timer and the follow engine use to find the car.
+     */
+    fun retarget(plate: String) {
+        if (recording != null) target = plate
     }
 
     @SuppressLint("MissingPermission")
@@ -106,7 +118,7 @@ class VideoRecorder(
             Log.w(TAG, "only ${free / (1024 * 1024)} MB free; not recording")
             return false
         }
-        val file = File(directory(), "tail_${STAMP.format(Date())}_${plate}.mp4")
+        val file = uniqueFile(plate)
         return runCatching {
             // A hard ceiling the encoder cannot talk its way past. The bitrate above is a request;
             // this is the guarantee, and CameraX finalizes the file properly when it is hit, so
@@ -115,26 +127,33 @@ class VideoRecorder(
                 .setFileSizeLimit(MAX_CLIP_BYTES)
                 .build()
             target = plate
-            startedAtMs = System.currentTimeMillis()
+            startedAtMs = SystemClock.elapsedRealtime()
             recording = capture.output
                 .prepareRecording(context, options)
                 // No audio: the app never asks for the microphone.
                 .start(executor) { event ->
                     if (event is VideoRecordEvent.Finalize) {
                         val plateForClip = target ?: plate
-                        val duration = elapsedMs
+                        // The encoder's own count of what it wrote, not a wall-clock difference.
+                        val duration = runCatching {
+                            event.recordingStats.recordedDurationNanos / 1_000_000L
+                        }.getOrDefault(elapsedMs)
                         recording = null
                         target = null
                         startedAtMs = 0L
                         val usable = !event.hasError() || RECOVERABLE_ERRORS.contains(event.error)
                         val hitLimit = event.hasError() && LIMIT_ERRORS.contains(event.error)
-                        if (usable && file.length() > MIN_USABLE_BYTES) {
+                        // "Something was encoded" is the test, not an arbitrary byte count: a
+                        // finalized three-second clip is a few tens of kilobytes and still evidence.
+                        val bytes = runCatching { event.recordingStats.numBytesRecorded }.getOrDefault(0L)
+                        val hasContent = (bytes > 0L || duration > 0L) && file.length() > MIN_USABLE_BYTES
+                        if (usable && hasContent) {
                             if (event.hasError()) Log.w(TAG, "partial clip kept: ${event.error}")
                             onFinished(file, plateForClip, duration, hitLimit)
                         } else {
                             // Only when there is genuinely nothing to keep. Evidence of a tail
                             // cannot be re-recorded, so a truncated clip beats no clip.
-                            Log.w(TAG, "recording failed: ${event.error}")
+                            Log.w(TAG, "recording failed: ${event.error} bytes=$bytes")
                             runCatching { file.delete() }
                             // Somebody has to be told, or the failure is invisible in the worst
                             // possible way: the banner says "🎥 Запись", the follow engine still
@@ -144,7 +163,7 @@ class VideoRecorder(
                         }
                     }
                 }
-            Log.i(TAG, "recording started for $plate")
+            Log.i(TAG, "recording started for $plate -> ${file.name}")
             true
         }.getOrElse { error ->
             Log.w(TAG, "cannot start recording", error)
@@ -157,6 +176,26 @@ class VideoRecorder(
     fun stop() {
         val active = recording ?: return
         runCatching { active.stop() }
+    }
+
+    /**
+     * A file name that cannot collide with a clip already on disk.
+     *
+     * The old `HHmmss` stamp repeated every day and every time two clips of the same car started
+     * within a second; CameraX opens the path with truncation, so the earlier recording — the only
+     * copy of it — was silently overwritten. The date and the milliseconds make the stamp unique in
+     * practice, and the existence check makes it unique in fact.
+     */
+    private fun uniqueFile(plate: String): File {
+        val dir = directory()
+        val now = System.currentTimeMillis()
+        var attempt = 0
+        while (true) {
+            val stamp = STAMP.format(Date(now + attempt))
+            val file = File(dir, "tail_${stamp}_${plate}.mp4")
+            if (!file.exists()) return file
+            attempt += 1
+        }
     }
 
     /**
@@ -202,10 +241,12 @@ class VideoRecorder(
         /** Free space below which starting a clip only produces a stub. */
         const val MIN_FREE_BYTES = MAX_CLIP_BYTES + 64L * 1024 * 1024
 
-        /** Below this the container holds only headers. */
-        const val MIN_USABLE_BYTES = 64L * 1024
+        /** Below this the container holds only headers: no `moov`, no sample, nothing to play. */
+        const val MIN_USABLE_BYTES = 4L * 1024
 
         const val TAG = "LensALPR.Video"
-        val STAMP = SimpleDateFormat("HHmmss", Locale.US)
+
+        /** Date and milliseconds: unique across days and across two clips started in one second. */
+        val STAMP = SimpleDateFormat("yyyyMMdd_HHmmssSSS", Locale.US)
     }
 }

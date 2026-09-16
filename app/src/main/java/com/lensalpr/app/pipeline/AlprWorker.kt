@@ -2,6 +2,7 @@ package com.lensalpr.app.pipeline
 
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.os.SystemClock
 import android.util.Log
 import com.lensalpr.app.alpr.AlprEngine
 import com.lensalpr.app.alpr.AlprOutcome
@@ -54,6 +55,12 @@ class OcrJob(
     val anchorRect: Rect = sourceRect,
     /** True when only the plate region was cut instead of the whole vehicle. */
     val narrow: Boolean = false,
+    /**
+     * True for a crop that waited on disk and was read later. Its result may still add a vote,
+     * but it says nothing about whether the *current* crop of the same track is done: the live
+     * job clears its own busy flag when it comes back, and this one must not clear it early.
+     */
+    val deferred: Boolean = false,
 )
 
 /** Reuses direct buffers so a 30 fps crop pipeline does not allocate native memory per frame. */
@@ -151,8 +158,31 @@ class AlprWorker(
     @Volatile
     private var running = false
 
+    /**
+     * Bumped on every [start]. A loop compares it with the value it was started with, so a loop
+     * whose `stop()` timed out — the engine was mid-frame and cannot be interrupted — exits on its
+     * own the moment a newer loop exists, instead of two threads draining one queue.
+     */
+    private val epoch = AtomicInteger(0)
+
     @Volatile
     var lastLatencyMs: Long = 0L
+        private set
+
+    /**
+     * When the engine last *finished* a crop, on the elapsed-realtime clock. Zero until it has.
+     *
+     * This — not the gate, not the queue — is what proves recognition is working: the runtime
+     * limit is only ever discovered inside a call, and frames flowing past an open gate on an
+     * empty road prove nothing about the engine at all.
+     */
+    @Volatile
+    var lastProcessedAtMs: Long = 0L
+        private set
+
+    /** When the current crop was handed to the engine, or zero while none is. */
+    @Volatile
+    var currentJobSinceMs: Long = 0L
         private set
 
     val queueDepth: Int get() = queue.size
@@ -193,7 +223,8 @@ class AlprWorker(
     fun start() {
         if (running) return
         running = true
-        thread = Thread({ loop() }, "alpr-worker").apply {
+        val myEpoch = epoch.incrementAndGet()
+        thread = Thread({ loop(myEpoch) }, "alpr-worker").apply {
             priority = Thread.NORM_PRIORITY + 1
             start()
         }
@@ -222,10 +253,14 @@ class AlprWorker(
      * Final teardown. Kept apart from [stop] because the session can be stopped and started again
      * from Telegram, and a shut-down executor would leave the restarted session unable to park
      * anything on disk.
+     *
+     * Orderly, not `shutdownNow`: a park task already accepted owns the only copy of its crop,
+     * and the promise made to the scheduler was that it would be on disk for the next start.
+     * The writer finishes the handful it holds on its own thread; nothing waits for it.
      */
     fun close() {
         stop()
-        spillExecutor.shutdownNow()
+        spillExecutor.shutdown()
     }
 
     /**
@@ -253,43 +288,34 @@ class AlprWorker(
             return true
         }
 
-        // Still no room: park the crop on disk rather than lose it. The engine picks it up
-        // during its next idle moment, and the job carries its own time and position.
-        val store = spill
-        if (store != null) {
-            // Park the least valuable crop, not the newest one. A close, unread car arriving while
-            // the queue is full of distant re-reads should go to the engine now and send one of
-            // them to disk instead — disk costs a delay, and the delay is survivable.
+        // Make room by displacing the least valuable crops — plural: freeing one slot does not
+        // free enough *bytes* when the newcomer is a larger crop, and enqueueing on a count alone
+        // let the queue grow past its memory budget exactly under the heaviest traffic.
+        val displaced = ArrayList<OcrJob>(2)
+        while (!hasRoom(bytes)) {
             val weakest = queue.minWithOrNull(
                 compareBy<OcrJob> { it.priority }.thenByDescending { it.submittedAtMs },
-            )
-            if (weakest != null && weakest.priority < job.priority && queue.remove(weakest)) {
-                queuedBytes.addAndGet(-weakest.buffer.capacity().toLong())
-                enqueue(job, bytes)
-                if (!park(store, weakest)) {
-                    dropped.incrementAndGet()
-                    discard(weakest)
-                }
-                return true
-            }
-            if (park(store, job)) return true
-            // The writer is saturated too; fall through and let the weakest crop go instead of
-            // holding the buffer hostage.
-            dropped.incrementAndGet()
-            discard(job)
-            return false
-        }
-
-        val weakest = queue.minWithOrNull(
-            compareBy<OcrJob> { it.priority }.thenByDescending { it.submittedAtMs },
-        )
-        if (weakest != null && weakest.priority < job.priority && queue.remove(weakest)) {
+            ) ?: break
+            if (weakest.priority >= job.priority || !queue.remove(weakest)) break
             queuedBytes.addAndGet(-weakest.buffer.capacity().toLong())
-            dropped.incrementAndGet()
-            discard(weakest)
+            displaced += weakest
+        }
+        val store = spill
+        if (hasRoom(bytes)) {
             enqueue(job, bytes)
+            // The displaced crops go to disk when possible, so a close, unread car arriving while
+            // the queue is full of distant re-reads costs those re-reads a delay, not their lives.
+            displaced.forEach { evicted ->
+                if (store == null || !park(store, evicted)) {
+                    dropped.incrementAndGet()
+                    discard(evicted)
+                }
+            }
             return true
         }
+        // Nothing weaker to displace — put back whatever was taken out and park the newcomer.
+        displaced.forEach { evicted -> enqueue(evicted, evicted.buffer.capacity().toLong()) }
+        if (store != null && park(store, job)) return true
         dropped.incrementAndGet()
         discard(job)
         return false
@@ -298,9 +324,14 @@ class AlprWorker(
     /**
      * Reads one parked crop. Called when the live queue runs dry, which is exactly when the engine
      * has spare time, and on demand while the scanner is paused.
+     *
+     * Only while the engine is actually able to read: the store deletes a crop the moment it is
+     * handed out, and feeding it to an engine that is restarting or out of entitlement destroyed
+     * the whole backlog without a single plate coming back.
      */
     fun drainOneSpilled(): Boolean {
         val store = spill ?: return false
+        if (!AlprEngine.status.isReady) return false
         val crop = store.poll() ?: return false
         val bitmap = crop.bitmap
         val stride = bitmap.rowBytes / 4
@@ -310,14 +341,19 @@ class AlprWorker(
         bitmap.copyPixelsToBuffer(buffer)
         buffer.rewind()
 
+        currentJobSinceMs = SystemClock.elapsedRealtime()
         val outcome = try {
             AlprEngine.process(buffer, bitmap.width, bitmap.height, stride)
         } catch (error: Throwable) {
             Log.e(TAG, "deferred recognition failed", error)
             AlprOutcome.failure(-3, error.message, 0L)
         }
+        currentJobSinceMs = 0L
         lastLatencyMs = outcome.latencyMs
-        val thumbnail = Bitmap.createScaledBitmap(
+        if (outcome.code != AlprEngine.CODE_RUNTIME_LIMIT) lastProcessedAtMs = SystemClock.elapsedRealtime()
+        // The saved picture of the whole car when there is one; a narrow crop is a plate, not a
+        // vehicle, and must not become the card's photograph.
+        val thumbnail = crop.thumbnail ?: Bitmap.createScaledBitmap(
             bitmap,
             minOf(bitmap.width, THUMBNAIL_WIDTH),
             maxOf(1, bitmap.height * minOf(bitmap.width, THUMBNAIL_WIDTH) / bitmap.width),
@@ -347,6 +383,8 @@ class AlprWorker(
             lat = crop.lat,
             lon = crop.lon,
             odometerM = crop.odometerM,
+            narrow = crop.narrow,
+            deferred = true,
         )
         pool.release(buffer)
         runCatching { onResult(job, outcome) }
@@ -379,8 +417,8 @@ class AlprWorker(
         queue.put(job)
     }
 
-    private fun loop() {
-        while (running) {
+    private fun loop(myEpoch: Int) {
+        while (running && epoch.get() == myEpoch) {
             val job = try {
                 queue.poll(120L, TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
@@ -392,7 +430,7 @@ class AlprWorker(
                 // One bad crop must cost one crop, not the worker thread and with it every
                 // recognition for the rest of the drive.
                 runCatching {
-                    while (running && queue.isEmpty() && drainOneSpilled()) {
+                    while (running && epoch.get() == myEpoch && queue.isEmpty() && drainOneSpilled()) {
                         // nothing further; each pass delivers one recovered plate
                     }
                 }.onFailure { error -> Log.w(TAG, "spill drain failed", error) }
@@ -404,18 +442,25 @@ class AlprWorker(
             // on the job, and its pixels remain a valid picture of that plate.
             val stale = System.currentTimeMillis() - job.submittedAtMs > staleAfterMs
             if (stale) {
+                // Too old for the live consensus, but not for the record: the pixels are still a
+                // plate, and disk is where such crops belong when there is a disk to put them on.
+                val store = spill
+                if (store != null && park(store, job)) continue
                 dropped.incrementAndGet()
                 discard(job)
                 continue
             }
 
+            currentJobSinceMs = SystemClock.elapsedRealtime()
             val outcome = try {
                 AlprEngine.process(job.buffer, job.width, job.height, job.strideInPixels)
             } catch (error: Throwable) {
                 Log.e(TAG, "recognition failed", error)
                 AlprOutcome.failure(-3, error.message, 0L)
             }
+            currentJobSinceMs = 0L
             lastLatencyMs = outcome.latencyMs
+            if (outcome.code != AlprEngine.CODE_RUNTIME_LIMIT) lastProcessedAtMs = SystemClock.elapsedRealtime()
             captureDir?.let { dir -> saveCrop(dir, job) }
             // One line per crop: enough to compare engine settings from logcat without guessing.
             Log.i(
@@ -439,10 +484,14 @@ class AlprWorker(
             bitmap.copyPixelsFromBuffer(job.buffer)
             job.buffer.rewind()
             val index = capturedCount
-            FileOutputStream(File(dir, "crop_%04d.jpg".format(index))).use { output ->
+            // Through a temporary name: the benchmark lists the directory the moment capture
+            // stops, and a JPEG still being written would otherwise be counted and fail to decode.
+            val pending = File(dir, "crop_%04d.tmp".format(index))
+            FileOutputStream(pending).use { output ->
                 bitmap.compress(CompressFormat.JPEG, 95, output)
             }
             bitmap.recycle()
+            pending.renameTo(File(dir, "crop_%04d.jpg".format(index)))
             File(dir, "index.txt").appendText(
                 "crop_%04d.jpg %dx%d lens=%s q=%.2f track=%d\n".format(
                     index, job.width, job.height, job.lensLabel, job.quality, job.trackId,

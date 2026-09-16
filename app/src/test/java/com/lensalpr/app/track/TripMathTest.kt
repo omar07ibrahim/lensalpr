@@ -24,10 +24,13 @@ class TripMathTest {
     }
 
     @Test
-    fun `a junction accumulates past the threshold in a few samples`() {
-        // Five one-second samples of a normal 90 degree turn: this is what has to be detected.
-        val samples = listOf(15f, 25f, 25f, 15f, 10f)
-        assertTrue(samples.sum() >= 40f)
+    fun `a junction accumulates past the threshold across the north wrap`() {
+        // Five one-second headings of a normal right turn that crosses north: the deltas the
+        // tracker sums must come out positive and add up to the turn, not to a 350-degree swing.
+        val headings = listOf(340f, 355f, 10f, 25f, 40f, 50f)
+        val total = headings.zipWithNext { from, to -> TripTracker.signedDelta(from, to) }.sum()
+        assertEquals(70f, total, 0.01f)
+        assertTrue(total >= 40f)
     }
 
     @Test

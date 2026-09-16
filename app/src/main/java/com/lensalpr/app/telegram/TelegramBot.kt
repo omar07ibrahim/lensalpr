@@ -7,9 +7,12 @@ import com.lensalpr.app.follow.AlertReason
 import com.lensalpr.app.follow.FollowEvidence
 import com.lensalpr.app.follow.ThreatLevel
 import com.lensalpr.app.settings.RuntimeSettings
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -71,6 +74,9 @@ interface BotHost {
     /** Marks a car as one of ours: no alerts, no video, no threat level. */
     fun setIgnored(plate: String, ignored: Boolean): String
 
+    /** Whether the operator has dismissed this car since; a queued alarm about it is void. */
+    fun isIgnored(plate: String): Boolean
+
     /** Marks a car as police: shouts like the blacklist, named as police. */
     fun setPolice(plate: String, police: Boolean): String
 
@@ -104,18 +110,26 @@ class TelegramBot(
     private val store: TrackingStore,
     private val host: BotHost,
     private val settings: () -> BotSettings,
+    /**
+     * Where undelivered alarms are kept between processes. The app restarts itself on purpose
+     * when the recognition engine dies, and an alarm raised in a tunnel a minute earlier must
+     * survive that — it is the only record that a car was called a tail.
+     */
+    private val outboxFile: File? = null,
 ) {
 
     /**
-     * Three lanes on purpose.
+     * Four lanes on purpose.
      *
      * A tail alert and a twenty-megabyte clip used to queue behind each other on one thread, so the
      * warning that matters could arrive minutes after the video that caused it — and while either
      * was uploading, the poller could not fetch /stop. Text is small and urgent, media is large and
-     * patient, and incoming commands must never wait for either.
+     * patient, incoming commands must never wait for either, and the photo that goes with an alarm
+     * gets a lane of its own so that neither a slow upload nor a slow clip can hold the next alarm.
      */
     private val sender = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "tg-sender") }
     private val media = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "tg-media") }
+    private val photos = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "tg-photos") }
     private val commands = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "tg-commands") }
     /**
      * Last level and moment each plate was alerted about, the duplicate guard for [alert].
@@ -163,11 +177,30 @@ class TelegramBot(
     @Volatile
     private var offset = 0L
 
+    /** The day-old backlog has been acknowledged; only then may polling start from [offset]. */
+    @Volatile
+    private var backlogSkipped = false
+
     /** When this bot was started; the baseline for "unreachable since". */
     @Volatile
     private var startedAtMs = 0L
 
+    /** What went wrong at startup, if the API answered but refused us. */
+    @Volatile
+    private var startupProblem: String? = null
+
     val isRunning: Boolean get() = running
+
+    /**
+     * Why the bot cannot work, in one line, or null while it can. "Cannot reach Telegram" is a
+     * different fact from "Telegram answers and refuses the token", and only the second one is
+     * worth a line in the pre-flight check — the first one comes and goes with the road.
+     */
+    fun problemText(): String? {
+        val active = client ?: return null
+        if (active.isRejected) return "Telegram отклоняет токен бота (${active.lastApiError ?: "401"})"
+        return startupProblem
+    }
 
     /**
      * Commands are answered whenever a valid token exists — the Telegram switch in the setup screen
@@ -186,13 +219,19 @@ class TelegramBot(
         client = created
         running = true
         startedAtMs = android.os.SystemClock.elapsedRealtime()
+        loadOutbox()
         startPoller(created)
         sender.execute {
             val name = created.getMe()
+            if (name == null) {
+                startupProblem = created.lastApiError?.let { "Bot API отказал: $it" }
+                Log.w(TAG, "getMe failed: ${created.lastApiError}")
+            }
             Log.i(TAG, "bot connected as @$name, alerts=${config.enabled}")
             val header = if (config.enabled) "🟢 <b>LensALPR</b> на связи\n" else "🔕 <b>LensALPR</b> на связи, алерты выключены\n"
             broadcastTo(created, config, header + host.statusText(), panel())
         }
+        if (synchronized(pendingAlerts) { pendingAlerts.isNotEmpty() }) scheduleAlertRetry(RETRY_DELAY_MS)
     }
 
     private fun startPoller(active: TelegramClient) {
@@ -262,6 +301,7 @@ class TelegramBot(
         }
         sender.shutdown()
         media.shutdown()
+        photos.shutdown()
         commands.shutdown()
         retries.shutdownNow()
         runCatching { sender.awaitTermination(2, TimeUnit.SECONDS) }
@@ -327,10 +367,6 @@ class TelegramBot(
                 listOf("📷 Кадр" to "photo", "🗺 Отчёт" to "report:1"),
             ),
         )
-        // A blacklisted car earns the full package: the alert, every photo we have of it, and a map
-        // of where it appeared - there is nothing to decide later, the evidence arrives at once.
-        // A car coming back does not: the dossier has already been sent once, and re-sending it
-        // every time would put a megabyte of history in front of a one-line warning.
         // The dossier — every photo of the car and a map of where it appeared — is worth sending
         // once. A car that keeps dropping out of frame and returning would otherwise pull a
         // megabyte of its own history into the chat on every reappearance, ahead of the one-line
@@ -345,27 +381,74 @@ class TelegramBot(
         val dossierDue = worthDossier && (dossierSentMs[evidence.plate]
             ?.let { now - it >= DOSSIER_COOLDOWN_MS }
             ?: true)
+        val alertPhoto = photo?.takeIf { it.exists() }
         sender.execute {
             val chats = recipients(config)
-            val delivered = deliverAlert(active, chats, text, markup, photo)
-            if (!delivered) {
+            // The words first, on the fast lane, to everybody. The picture follows on its own lane:
+            // a stalled photo upload used to stand in front of the next alarm and every urgent
+            // broadcast for as long as the uplink took.
+            val failed = deliverText(active, chats, text, markup)
+            val reached = chats.filter { it !in failed }
+            if (chats.isNotEmpty() && reached.isEmpty()) {
                 // A tunnel, a dead cell, a 429. The alarm was raised and nobody heard it — and
                 // because the engine rations repeats, the next chance may be many minutes away or
                 // may never come. Put it in the queue instead of losing it, and roll the cooldown
                 // back so a genuine second attempt is not mistaken for a duplicate.
                 if (previous != null) alertState[evidence.plate] = previous else alertState.remove(evidence.plate)
-                queueAlert(PendingAlert(evidence.plate, text, markup, photo?.path, evidence.level.rank, now))
+                queueAlert(
+                    PendingAlert(
+                        evidence.plate, evidence.storeKey, evidence.displayPlate, text, markup,
+                        alertPhoto?.path, evidence.level.rank, now, chats = chats, dossier = dossierDue,
+                    ),
+                )
                 return@execute
             }
-            if (!dossierDue) return@execute
-            // Claim the window atomically: two alarms about the same car may reach this point
-            // together, and both would otherwise send the whole history.
-            val claimed = dossierSentMs.compute(evidence.plate) { _, previousSend ->
-                if (previousSend == null || now - previousSend >= DOSSIER_COOLDOWN_MS) now else previousSend
-            } == now
-            if (!claimed) return@execute
+            // Somebody heard it; whoever did not is retried on their own, not forgotten because
+            // one admin's phone was in coverage.
+            if (failed.isNotEmpty()) {
+                queueAlert(
+                    PendingAlert(
+                        evidence.plate, evidence.storeKey, evidence.displayPlate, text, markup,
+                        alertPhoto?.path, evidence.level.rank, now, chats = failed, dossier = false,
+                    ),
+                )
+            }
+            if (alertPhoto != null) sendAlertPhoto(active, reached, alertPhoto, evidence.displayPlate)
+            if (dossierDue) sendDossier(active, reached, evidence.plate, evidence.storeKey, evidence.displayPlate, now)
+        }
+    }
+
+    private fun sendAlertPhoto(active: TelegramClient, chats: List<Long>, photo: File, displayPlate: String) {
+        runCatching {
+            photos.execute {
+                if (!photo.exists()) return@execute
+                chats.forEach { chatId -> active.sendPhoto(chatId, photo, "📷 <code>${TelegramClient.escape(displayPlate)}</code>") }
+            }
+        }
+    }
+
+    /**
+     * A blacklisted car or a confirmed tail earns the full package: every photo we have of it and
+     * a map of where it appeared — there is nothing to decide later, the evidence arrives at once.
+     * Claimed atomically: two alarms about the same car may reach this point together, and both
+     * would otherwise send the whole history.
+     */
+    private fun sendDossier(
+        active: TelegramClient,
+        chats: List<Long>,
+        plate: String,
+        storeKey: String,
+        displayPlate: String,
+        now: Long,
+    ) {
+        if (chats.isEmpty()) return
+        val claimed = dossierSentMs.compute(plate) { _, previousSend ->
+            if (previousSend == null || now - previousSend >= DOSSIER_COOLDOWN_MS) now else previousSend
+        } == now
+        if (!claimed) return
+        runCatching {
             media.execute {
-                val card = host.vehicleCard(evidence.storeKey)
+                val card = host.vehicleCard(storeKey)
                 // takeLast, not take: the card lists encounters oldest first, and a car met all
                 // week would otherwise arrive as six pictures from Monday and nothing from today.
                 val shots = card?.second?.takeLast(MAX_PHOTOS).orEmpty()
@@ -389,74 +472,132 @@ class TelegramBot(
                         )
                     }
                 }
-                val report = host.buildVehicleReport(evidence.storeKey)
+                val report = host.buildVehicleReport(storeKey)
                 if (report != null) {
-                    chats.forEach { chatId ->
+                    val delivered = chats.map { chatId ->
                         active.sendDocument(
                             chatId,
                             report,
-                            "🗺 <code>${evidence.displayPlate}</code> — карта встреч и маршрута",
+                            "🗺 <code>${TelegramClient.escape(displayPlate)}</code> — карта встреч и маршрута",
                         )
+                    }.any { it }
+                    if (!delivered) {
+                        chats.forEach { chatId ->
+                            active.sendMessage(chatId, "⚠️ Карта встреч <code>${TelegramClient.escape(displayPlate)}</code> не отправилась — запроси /plate позже.", null)
+                        }
                     }
                 }
             }
         }
     }
 
-    /** One alarm that has not reached anybody yet. */
+    /** One alarm that has not reached everybody yet. */
     private class PendingAlert(
         val plate: String,
+        val storeKey: String,
+        val displayPlate: String,
         val text: String,
         val markup: String?,
         /** Kept as a path: the file may be pruned while the alarm waits. */
         val photoPath: String?,
         val levelRank: Int,
         val raisedAtMs: Long,
+        /** Who still has to receive it; shrinks as deliveries succeed. */
+        var chats: List<Long>,
+        /** The dossier still owed once the alarm itself lands. */
+        val dossier: Boolean,
         var attempts: Int = 0,
-    )
+    ) {
+        fun toJson(): JSONObject = JSONObject()
+            .put("plate", plate)
+            .put("storeKey", storeKey)
+            .put("display", displayPlate)
+            .put("text", text)
+            .put("markup", markup ?: JSONObject.NULL)
+            .put("photo", photoPath ?: JSONObject.NULL)
+            .put("level", levelRank)
+            .put("raisedAt", raisedAtMs)
+            .put("chats", JSONArray(chats))
+            .put("dossier", dossier)
+            .put("attempts", attempts)
+
+        companion object {
+            fun fromJson(json: JSONObject): PendingAlert? {
+                val plate = json.optString("plate").takeIf { it.isNotBlank() } ?: return null
+                val chats = json.optJSONArray("chats")?.let { array ->
+                    (0 until array.length()).map { array.optLong(it) }.filter { it != 0L }
+                }.orEmpty()
+                return PendingAlert(
+                    plate = plate,
+                    storeKey = json.optString("storeKey", plate),
+                    displayPlate = json.optString("display", plate),
+                    text = json.optString("text"),
+                    markup = json.optString("markup").takeIf { it.isNotBlank() && it != "null" },
+                    photoPath = json.optString("photo").takeIf { it.isNotBlank() && it != "null" },
+                    levelRank = json.optInt("level", 0),
+                    raisedAtMs = json.optLong("raisedAt", 0L),
+                    chats = chats,
+                    dossier = json.optBoolean("dossier", false),
+                    attempts = json.optInt("attempts", 0),
+                )
+            }
+        }
+    }
 
     /**
-     * Sends one alarm to everybody and says whether it reached anybody at all.
+     * Sends one text to everybody and returns who did *not* get it.
      *
-     * The photo is a bonus; the warning is the point. A rejected upload — too large, a 429, a
-     * dropped connection — used to take the whole alarm down with it.
+     * The old "did anybody get it" boolean called an alarm delivered when one admin's phone was
+     * in coverage and the owner's was not; the owner never received it and nothing retried.
      */
-    private fun deliverAlert(
+    private fun deliverText(
         active: TelegramClient,
         chats: List<Long>,
         text: String,
         markup: String?,
-        photo: File?,
-    ): Boolean {
-        // Nobody to tell is not a failure to retry; it is a bot with no admins.
-        if (chats.isEmpty()) return true
-        return chats.map { chatId ->
-            val sent = if (photo != null && photo.exists()) {
-                active.sendPhoto(chatId, photo, text, markup)
-            } else {
-                false
-            }
-            sent || active.sendMessage(chatId, text, markup)
-        }.any { it }
-    }
+    ): List<Long> = chats.filter { chatId -> !active.sendMessage(chatId, text, markup) }
 
     /**
      * Parks an undelivered alarm and starts the retry loop if it is not already running.
      *
-     * Bounded, and the eviction is not by age alone: under pressure a WATCH from ten minutes ago
-     * is worth dropping, a TAIL never is.
+     * One entry per car: a tail that keeps producing "still behind us" while the signal is gone
+     * used to fill the whole queue with copies of itself and push the one warning about a
+     * *different* car out. And the victim, when the queue is full, is the least urgent of the
+     * queue *and* the newcomer — a WATCH arriving late never displaces a waiting TAIL.
      */
     private fun queueAlert(alert: PendingAlert) {
         synchronized(pendingAlerts) {
-            if (pendingAlerts.size >= MAX_PENDING_ALERTS) {
-                val victim = pendingAlerts
-                    .filter { it.levelRank < ThreatLevel.TAIL.rank }
-                    .minByOrNull { it.raisedAtMs }
-                    ?: pendingAlerts.minByOrNull { it.raisedAtMs }
-                pendingAlerts.remove(victim)
-                Log.w(TAG, "alert queue full; dropped ${victim?.plate}")
+            val same = pendingAlerts.indexOfFirst { it.plate == alert.plate }
+            if (same >= 0) {
+                val old = pendingAlerts[same]
+                pendingAlerts[same] = PendingAlert(
+                    plate = alert.plate,
+                    storeKey = alert.storeKey,
+                    displayPlate = alert.displayPlate,
+                    text = alert.text,
+                    markup = alert.markup,
+                    photoPath = alert.photoPath ?: old.photoPath,
+                    levelRank = maxOf(old.levelRank, alert.levelRank),
+                    raisedAtMs = old.raisedAtMs,
+                    chats = (old.chats + alert.chats).distinct(),
+                    dossier = old.dossier || alert.dossier,
+                    attempts = old.attempts,
+                )
+            } else {
+                if (pendingAlerts.size >= MAX_PENDING_ALERTS) {
+                    val victim = (pendingAlerts + alert).minWithOrNull(
+                        compareBy<PendingAlert> { it.levelRank }.thenBy { it.raisedAtMs },
+                    )
+                    if (victim === alert) {
+                        Log.w(TAG, "alert queue full; not queueing ${alert.plate}")
+                        return
+                    }
+                    pendingAlerts.remove(victim)
+                    Log.w(TAG, "alert queue full; dropped ${victim?.plate}")
+                }
+                pendingAlerts += alert
             }
-            pendingAlerts += alert
+            persistOutbox()
         }
         Log.w(TAG, "alert for ${alert.plate} queued for retry")
         scheduleAlertRetry(RETRY_DELAY_MS)
@@ -464,14 +605,18 @@ class TelegramBot(
 
     private fun scheduleAlertRetry(delayMs: Long) {
         if (!retryScheduled.compareAndSet(false, true)) return
-        retries.schedule({ runCatching { flushPendingAlerts() } }, delayMs, TimeUnit.MILLISECONDS)
+        runCatching {
+            retries.schedule({ runCatching { flushPendingAlerts() } }, delayMs, TimeUnit.MILLISECONDS)
+        }.onFailure { retryScheduled.set(false) }
     }
 
     /**
      * Tries every parked alarm once.
      *
      * Runs on its own lane: the text lane may be busy with the alarm that is arriving right now,
-     * and a retry must never be what delays it.
+     * and a retry must never be what delays it. Mute and dismissal apply at delivery time, not at
+     * the time the alarm was raised: an alarm that waited through "/mute" is not sent while the
+     * mute lasts, and one about a car the operator has since dismissed is dropped.
      */
     private fun flushPendingAlerts() {
         retryScheduled.set(false)
@@ -479,36 +624,57 @@ class TelegramBot(
         val config = settings()
         val batch = synchronized(pendingAlerts) { pendingAlerts.toList() }
         if (batch.isEmpty()) return
-        val chats = recipients(config)
+        if (!config.enabled || muted) {
+            // Paused, not failed: no attempt is spent, the queue simply waits for the mute to end.
+            scheduleAlertRetry(RETRY_BACKOFF_MS.last())
+            return
+        }
         var anyLeft = false
         // Local: this method only ever runs on the retry lane, one pass at a time.
         val lost = ArrayList<String>()
         batch.forEach { alert ->
+            if (runCatching { host.isIgnored(alert.plate) }.getOrDefault(false)) {
+                synchronized(pendingAlerts) { pendingAlerts.remove(alert) }
+                Log.i(TAG, "queued alert for ${alert.plate} dropped: car dismissed meanwhile")
+                return@forEach
+            }
             alert.attempts += 1
             val photo = alert.photoPath?.let(::File)?.takeIf { it.exists() }
             val prefix = "🔁 <i>с задержкой, связи не было</i>\n"
-            val ok = config.enabled &&
-                deliverAlert(active, chats, prefix + alert.text, alert.markup, photo)
-            if (ok) {
-                synchronized(pendingAlerts) { pendingAlerts.remove(alert) }
-                Log.i(TAG, "queued alert for ${alert.plate} delivered on attempt ${alert.attempts}")
-            } else if (alert.attempts >= MAX_ALERT_ATTEMPTS) {
-                synchronized(pendingAlerts) { pendingAlerts.remove(alert) }
-                Log.e(TAG, "giving up on the alert for ${alert.plate}")
-                // Never silently: the driver has to learn that a warning existed and never
-                // arrived, even if it is now history.
-                lost += alert.plate
-            } else {
-                anyLeft = true
+            val failed = deliverText(active, alert.chats, prefix + alert.text, alert.markup)
+            val reached = alert.chats.filter { it !in failed }
+            if (reached.isNotEmpty()) {
+                Log.i(TAG, "queued alert for ${alert.plate} delivered to ${reached.size} on attempt ${alert.attempts}")
+                if (photo != null) sendAlertPhoto(active, reached, photo, alert.displayPlate)
+                // The dossier was owed with the alarm and travels with the retry — a tail confirmed
+                // in a tunnel used to arrive as a bare line with no photos and no map, ever.
+                if (alert.dossier) {
+                    sendDossier(active, reached, alert.plate, alert.storeKey, alert.displayPlate, System.currentTimeMillis())
+                }
+            }
+            when {
+                failed.isEmpty() -> synchronized(pendingAlerts) { pendingAlerts.remove(alert) }
+                alert.attempts >= MAX_ALERT_ATTEMPTS -> {
+                    synchronized(pendingAlerts) { pendingAlerts.remove(alert) }
+                    Log.e(TAG, "giving up on the alert for ${alert.plate}")
+                    // Never silently: the driver has to learn that a warning existed and never
+                    // arrived, even if it is now history.
+                    lost += alert.plate
+                }
+                else -> {
+                    alert.chats = failed
+                    anyLeft = true
+                }
             }
         }
+        synchronized(pendingAlerts) { persistOutbox() }
         if (lost.isNotEmpty()) {
-            sender.execute {
-                active.let { bot ->
+            runCatching {
+                sender.execute {
                     recipients(config).forEach { chatId ->
-                        bot.sendMessage(
+                        active.sendMessage(
                             chatId,
-                            "⚠️ Тревог не доставлено: ${lost.joinToString(", ")}. " +
+                            "⚠️ Тревог не доставлено: ${lost.joinToString(", ") { TelegramClient.escape(it) }}. " +
                                 "Связи не было слишком долго — смотри отчёт.",
                             panel(),
                         )
@@ -517,10 +683,54 @@ class TelegramBot(
             }
         }
         if (anyLeft) {
-            // Backoff by the most-tried entry, so one hopeless alarm cannot make the rest slow.
-            val worst = synchronized(pendingAlerts) { pendingAlerts.minOfOrNull { it.attempts } ?: 0 }
-            val delay = RETRY_BACKOFF_MS.getOrElse(worst) { RETRY_BACKOFF_MS.last() }
+            // Backoff by the least-tried entry, so one hopeless alarm cannot make the rest slow.
+            val fewest = synchronized(pendingAlerts) { pendingAlerts.minOfOrNull { it.attempts } ?: 0 }
+            val delay = RETRY_BACKOFF_MS.getOrElse(fewest) { RETRY_BACKOFF_MS.last() }
             scheduleAlertRetry(delay)
+        }
+    }
+
+    /** The queue as a file, so a deliberate process restart does not erase it. Under the monitor. */
+    private fun persistOutbox() {
+        val file = outboxFile ?: return
+        runCatching {
+            if (pendingAlerts.isEmpty()) {
+                file.delete()
+                return
+            }
+            val array = JSONArray()
+            pendingAlerts.forEach { array.put(it.toJson()) }
+            val pending = File(file.parentFile, file.name + ".tmp")
+            pending.writeText(array.toString())
+            if (!pending.renameTo(file)) pending.delete()
+        }.onFailure { error -> Log.w(TAG, "cannot persist the alert outbox", error) }
+    }
+
+    private fun loadOutbox() {
+        val file = outboxFile ?: return
+        if (!file.exists()) return
+        val now = System.currentTimeMillis()
+        runCatching {
+            val array = JSONArray(file.readText())
+            val loaded = (0 until array.length()).mapNotNull { index ->
+                array.optJSONObject(index)?.let(PendingAlert::fromJson)
+            }.filter { now - it.raisedAtMs <= OUTBOX_TTL_MS && it.chats.isNotEmpty() }
+            synchronized(pendingAlerts) {
+                loaded.forEach { alert -> if (pendingAlerts.none { it.plate == alert.plate }) pendingAlerts += alert }
+                persistOutbox()
+            }
+            if (loaded.isNotEmpty()) Log.i(TAG, "restored ${loaded.size} undelivered alerts")
+        }.onFailure { error ->
+            Log.w(TAG, "cannot read the alert outbox", error)
+            runCatching { file.delete() }
+        }
+    }
+
+    /** A car the operator has just dismissed or renamed has no business in the queue. */
+    private fun forgetPlate(vararg plates: String) {
+        plates.forEach { alertState.remove(it) }
+        synchronized(pendingAlerts) {
+            if (pendingAlerts.removeAll { it.plate in plates || it.storeKey in plates }) persistOutbox()
         }
     }
 
@@ -532,7 +742,7 @@ class TelegramBot(
      * car had been met five times. A timestamp cannot contradict the counter.
      */
     private fun photoCaption(file: File): String =
-        "📷 " + PHOTO_TIME.format(Date(file.lastModified()))
+        "📷 " + PHOTO_TIME.format(Instant.ofEpochMilli(file.lastModified()).atZone(ZoneId.systemDefault()))
 
     /**
      * Sends the clip recorded while a vehicle was tailing us and reports whether it arrived.
@@ -554,23 +764,25 @@ class TelegramBot(
         val megabytes = file.length() / (1024.0 * 1024.0)
         val seconds = durationMs / 1000
         val caption = buildString {
-            append("🎥 <code>$plate</code> — запись преследования")
+            append("🎥 <code>${TelegramClient.escape(plate)}</code> — запись преследования")
             if (seconds > 0) append(", $seconds с")
             append(String.format(Locale.US, ", %.1f МБ", megabytes))
         }
         runCatching { media.execute {
             val chats = recipients(config)
+            // Delivered means delivered to everybody; the owner's phone out of coverage while an
+            // admin's was in must not mark the file as sent and drop it from the resend queue.
             val delivered = if (megabytes > MAX_UPLOAD_MB) {
                 false
             } else {
-                chats.map { chatId -> active.sendVideo(chatId, file, caption) }.any { it }
+                chats.isNotEmpty() && chats.map { chatId -> active.sendVideo(chatId, file, caption) }.all { it }
             }
             if (!delivered) {
                 val reason = if (megabytes > MAX_UPLOAD_MB) "больше лимита Telegram" else "Telegram не принял"
                 chats.forEach { chatId ->
                     active.sendMessage(
                         chatId,
-                        "⚠️ Видео <code>$plate</code> не отправилось ($reason, " +
+                        "⚠️ Видео <code>${TelegramClient.escape(plate)}</code> не отправилось ($reason, " +
                             String.format(Locale.US, "%.1f МБ", megabytes) +
                             "). Файл на телефоне: <code>${file.name}</code>",
                         panel(),
@@ -581,14 +793,18 @@ class TelegramBot(
         } }.onFailure { onDelivered(false) }
     }
 
-    /** Sends a built report to every admin on the media lane. */
+    /** Sends a built report to every admin on the media lane, and says so when it does not arrive. */
     fun sendReport(file: File, caption: String) {
         val active = client ?: return
         val config = settings()
         if (!config.enabled || muted || !file.exists()) return
         runCatching {
             media.execute {
-                recipients(config).forEach { chatId -> active.sendDocument(chatId, file, caption) }
+                recipients(config).forEach { chatId ->
+                    if (!active.sendDocument(chatId, file, caption)) {
+                        active.sendMessage(chatId, "⚠️ Отчёт не отправился (${file.length() / 1024} КБ) — запроси /report позже.", null)
+                    }
+                }
             }
         }
     }
@@ -596,18 +812,21 @@ class TelegramBot(
     /**
      * @param urgent bypasses the mute. Reserved for things the operator would want even after
      *   asking for quiet — a crashed session, a blind camera — never for routine chatter.
+     * @param onDone whether anybody received it; a caller that deletes something on delivery
+     *   must wait for this rather than assume it.
      */
-    fun broadcast(text: String, urgent: Boolean = false) {
-        val active = client ?: return
+    fun broadcast(text: String, urgent: Boolean = false, onDone: (Boolean) -> Unit = {}) {
+        val active = client ?: return onDone(false)
         val config = settings()
-        if (!config.enabled) return
-        if (muted && !urgent) return
-        runCatching { sender.execute { broadcastTo(active, config, text, null) } }
+        if (!config.enabled) return onDone(false)
+        if (muted && !urgent) return onDone(false)
+        runCatching {
+            sender.execute { onDone(broadcastTo(active, config, text, null)) }
+        }.onFailure { onDone(false) }
     }
 
-    private fun broadcastTo(active: TelegramClient, config: BotSettings, text: String, markup: String?) {
-        recipients(config).forEach { chatId -> active.sendMessage(chatId, text, markup) }
-    }
+    private fun broadcastTo(active: TelegramClient, config: BotSettings, text: String, markup: String?): Boolean =
+        recipients(config).map { chatId -> active.sendMessage(chatId, text, markup) }.any { it }
 
     private fun recipients(config: BotSettings): List<Long> {
         val admins = runCatching { store.admins().map(AdminRow::chatId) }.getOrDefault(emptyList())
@@ -619,17 +838,24 @@ class TelegramBot(
     private fun loop(active: TelegramClient) {
         Log.i(TAG, "poller started")
         // Telegram replays unconfirmed updates for a day; without this the bot would re-execute
-        // yesterday's commands on every restart. Inside its own guard: it is a network call, and
-        // failing it must not be what kills the poller before it has fetched a single update.
-        if (offset == 0L) {
-            runCatching { active.getUpdates(-1L).lastOrNull()?.let { offset = it.updateId + 1 } }
-                .onFailure { error -> Log.w(TAG, "could not skip the backlog", error) }
+        // yesterday's commands on every restart. The skip has to *succeed* before polling may
+        // begin: a failed skip used to fall through to offset 0 and replay the lot. And it asks
+        // with no long-poll timeout — with one, a command typed in the first thirty seconds
+        // arrived as "the last update" and was thrown away as backlog.
+        while (running && !backlogSkipped) {
+            val last = active.getUpdates(-1L, timeoutSeconds = 0L)
+            if (last == null) {
+                runCatching { Thread.sleep(RETRY_DELAY_MS) }
+                continue
+            }
+            last.lastOrNull()?.let { offset = maxOf(offset, it.updateId + 1) }
+            backlogSkipped = true
         }
 
         try {
             while (running) {
                 val startedAt = System.currentTimeMillis()
-                val updates = active.getUpdates(offset)
+                val updates = active.getUpdates(offset).orEmpty()
                 if (updates.isEmpty()) {
                     if (!running) break
                     if (System.currentTimeMillis() - startedAt < 1_000L) {
@@ -672,7 +898,7 @@ class TelegramBot(
             if (config.ownerId != 0L) {
                 active.sendMessage(
                     config.ownerId,
-                    "Запрос доступа от ${escape(update.senderName)}, id <code>${update.senderId}</code>",
+                    "Запрос доступа от ${TelegramClient.escape(update.senderName)}, id <code>${update.senderId}</code>",
                     TelegramClient.inlineRow(listOf("✅ Добавить админом" to "approve:${update.senderId}")),
                 )
             }
@@ -706,11 +932,14 @@ class TelegramBot(
             "/list" -> active.sendMessage(update.chatId, host.listVehicles(ThreatLevel.WATCH.rank), panel())
             "/all" -> active.sendMessage(update.chatId, host.listVehicles(ThreatLevel.IGNORE.rank), panel())
             "/find" -> active.sendMessage(update.chatId, host.findPlates(argument), panel())
-            "/plate" -> sendVehicleCard(active, update.chatId, argument)
+            "/plate", "/card" -> sendVehicleCard(active, update.chatId, argument)
             "/bl" -> active.sendMessage(update.chatId, host.setBlacklist(argument, true), panel())
             "/unbl" -> active.sendMessage(update.chatId, host.setBlacklist(argument, false), panel())
             "/blacklist" -> active.sendMessage(update.chatId, host.blacklistText(), panel())
-            "/ignore", "/ign" -> active.sendMessage(update.chatId, host.setIgnored(argument, true), panel())
+            "/ignore", "/ign" -> {
+                forgetPlate(argument.uppercase().replace(Regex("[^A-Z0-9]"), ""))
+                active.sendMessage(update.chatId, host.setIgnored(argument, true), panel())
+            }
             "/unignore", "/unign" -> active.sendMessage(update.chatId, host.setIgnored(argument, false), panel())
             "/ignored" -> active.sendMessage(update.chatId, host.ignoredText(), panel())
             "/police", "/pol" -> active.sendMessage(update.chatId, host.setPolice(argument, true), panel())
@@ -729,8 +958,7 @@ class TelegramBot(
                 } else {
                     // The cooldown is keyed by plate; leaving the old key behind would mute the
                     // corrected spelling for three minutes and keep a ghost entry forever.
-                    alertState.remove(from.uppercase())
-                    alertState.remove(to.uppercase())
+                    forgetPlate(from.uppercase(), to.uppercase())
                     active.sendMessage(update.chatId, host.renamePlate(from, to), panel())
                 }
             }
@@ -788,12 +1016,16 @@ class TelegramBot(
 
             action == "check" -> active.sendMessage(chatId, host.preflightText(), panel())
 
-            action == "photo" -> {
-                val photo = host.snapshot()
-                if (photo == null) {
-                    active.sendMessage(chatId, "Камера не отдала кадр", panel())
-                } else {
-                    active.sendPhoto(chatId, photo, "📷 Кадр с камеры", panel())
+            // Slow work leaves the command lane at once: a frame grab waits on the camera and an
+            // upload waits on the uplink, and /stop must never wait behind either.
+            action == "photo" -> runCatching {
+                media.execute {
+                    val photo = host.snapshot()
+                    if (photo == null) {
+                        active.sendMessage(chatId, "Камера не отдала кадр", panel())
+                    } else {
+                        active.sendPhoto(chatId, photo, "📷 Кадр с камеры", panel())
+                    }
                 }
             }
 
@@ -805,15 +1037,20 @@ class TelegramBot(
                     host.currentTripStartMs()
                 }
                 active.sendMessage(chatId, "🗺 Собираю отчёт…")
-                val file = host.buildReport(since)
-                if (file == null) {
-                    active.sendMessage(chatId, "Нет данных за период", panel())
-                } else {
-                    active.sendDocument(
-                        chatId,
-                        file,
-                        "Отчёт LensALPR — открой в браузере: карта, маршрут и фото каждой встречи",
-                    )
+                runCatching {
+                    media.execute {
+                        val file = host.buildReport(since)
+                        if (file == null) {
+                            active.sendMessage(chatId, "Нет данных за период", panel())
+                        } else if (!active.sendDocument(
+                                chatId,
+                                file,
+                                "Отчёт LensALPR — открой в браузере: карта, маршрут и фото каждой встречи",
+                            )
+                        ) {
+                            active.sendMessage(chatId, "⚠️ Отчёт собран (${file.length() / 1024} КБ), но Telegram его не принял — попробуй позже.", panel())
+                        }
+                    }
                 }
             }
 
@@ -822,6 +1059,7 @@ class TelegramBot(
 
             action.startsWith("ign:") -> {
                 val plate = action.removePrefix("ign:")
+                forgetPlate(plate)
                 active.sendMessage(chatId, host.setIgnored(plate, true), panel())
             }
 
@@ -845,8 +1083,12 @@ class TelegramBot(
             action.startsWith("bl:") -> {
                 val plate = action.removePrefix("bl:")
                 active.sendMessage(chatId, host.setBlacklist(plate, true), panel())
-                host.buildVehicleReport(plate)?.let { report ->
-                    active.sendDocument(chatId, report, "🗺 Карта встреч этой машины")
+                runCatching {
+                    media.execute {
+                        host.buildVehicleReport(plate)?.let { report ->
+                            active.sendDocument(chatId, report, "🗺 Карта встреч этой машины")
+                        }
+                    }
                 }
             }
 
@@ -872,6 +1114,7 @@ class TelegramBot(
             action == "mute:off" -> {
                 muted = false
                 active.sendMessage(chatId, "🔔 Уведомления включены", panel())
+                if (synchronized(pendingAlerts) { pendingAlerts.isNotEmpty() }) scheduleAlertRetry(RETRY_DELAY_MS)
             }
 
             action == "mute" -> {
@@ -881,6 +1124,7 @@ class TelegramBot(
                     if (muted) "🔕 Уведомления выключены" else "🔔 Уведомления включены",
                     panel(),
                 )
+                if (!muted && synchronized(pendingAlerts) { pendingAlerts.isNotEmpty() }) scheduleAlertRetry(RETRY_DELAY_MS)
             }
 
             action == "who" -> active.sendMessage(chatId, host.companionsText(), panel())
@@ -904,9 +1148,14 @@ class TelegramBot(
                     active.sendMessage(chatId, "Стирать данные может только владелец", panel())
                 } else {
                     // The evidence is gone; the memory of having warned about it has to go too, or
-                    // the first sighting after a wipe is silently treated as a duplicate.
+                    // the first sighting after a wipe is silently treated as a duplicate — and
+                    // the alarms still waiting to be sent are about cars that no longer exist.
                     alertState.clear()
                     dossierSentMs.clear()
+                    synchronized(pendingAlerts) {
+                        pendingAlerts.clear()
+                        persistOutbox()
+                    }
                     active.sendMessage(chatId, host.wipeAll(), panel())
                 }
             }
@@ -944,7 +1193,7 @@ class TelegramBot(
     private fun sendVehicleCard(active: TelegramClient, chatId: Long, plate: String) {
         val card = host.vehicleCard(plate)
         if (card == null) {
-            active.sendMessage(chatId, "Не встречалась: <code>$plate</code>", panel())
+            active.sendMessage(chatId, "Не встречалась: <code>${TelegramClient.escape(plate)}</code>", panel())
             return
         }
         active.sendMessage(
@@ -960,9 +1209,15 @@ class TelegramBot(
                 "📷 показываю последние ${shots.size} снимков из ${card.second.size}",
             )
         }
-        val failed = shots.count { photo -> !active.sendPhoto(chatId, photo, photoCaption(photo)) }
-        if (failed > 0) {
-            active.sendMessage(chatId, "⚠️ $failed из ${shots.size} фото не ушли — повтори /card")
+        // The uploads leave the command lane: a dozen photos take a while on a mobile uplink and
+        // the operator's next command must not wait for them.
+        runCatching {
+            media.execute {
+                val failed = shots.count { photo -> !active.sendPhoto(chatId, photo, photoCaption(photo)) }
+                if (failed > 0) {
+                    active.sendMessage(chatId, "⚠️ $failed из ${shots.size} фото не ушли — повтори <code>/plate ${TelegramClient.escape(plate)}</code>")
+                }
+            }
         }
     }
 
@@ -1001,7 +1256,7 @@ class TelegramBot(
             if (admins.isEmpty()) {
                 append("больше никого\n")
             } else {
-                admins.forEach { admin -> append("• <code>${admin.chatId}</code> — ${admin.title}\n") }
+                admins.forEach { admin -> append("• <code>${admin.chatId}</code> — ${TelegramClient.escape(admin.title)}\n") }
             }
             append("\nДобавить: <code>/addadmin id</code>  ·  убрать: <code>/deladmin id</code>")
         }
@@ -1064,12 +1319,6 @@ class TelegramBot(
         return TelegramClient.inlineKeyboard(rows + listOf(listOf("⬅️ Меню" to "status")))
     }
 
-    /** Telegram parses HTML in every message; free text has to survive that. */
-    private fun escape(text: String): String = text
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-
     /**
      * The alarm as the driver reads it at a red light.
      *
@@ -1097,14 +1346,14 @@ class TelegramBot(
         val details = listOfNotNull(evidence.makeModel, evidence.color).joinToString(" · ")
         return buildString {
             append(header).append('\n')
-            append("<code>${evidence.displayPlate}</code>")
-            if (details.isNotBlank()) append("  $details")
+            append("<code>${TelegramClient.escape(evidence.displayPlate)}</code>")
+            if (details.isNotBlank()) append("  ${TelegramClient.escape(details)}")
             append('\n')
             if (reason != AlertReason.RAISED && evidence.awayMs >= 60_000L) {
                 append("пропадала на ${evidence.awayMs / 60_000} мин\n")
             }
-            if (evidence.reasons.isNotEmpty()) append(evidence.reasons.joinToString(" · ")).append('\n')
-            append("линза ${evidence.lastLens ?: "?"} · встреч ${evidence.encounters}")
+            if (evidence.reasons.isNotEmpty()) append(TelegramClient.escape(evidence.reasons.joinToString(" · "))).append('\n')
+            append("линза ${TelegramClient.escape(evidence.lastLens ?: "?")} · встреч ${evidence.encounters}")
         }
     }
 
@@ -1133,11 +1382,16 @@ class TelegramBot(
         /** Attempts before an alarm is written off — about twenty minutes of trying. */
         const val MAX_ALERT_ATTEMPTS = 10
 
+        /** An alarm older than this on disk is history, not a warning worth delivering late. */
+        const val OUTBOX_TTL_MS = 2L * 3_600_000L
+
         /** Delay before each retry pass, indexed by the least-tried alarm in the queue. */
         val RETRY_BACKOFF_MS = longArrayOf(
             5_000L, 10_000L, 20_000L, 30_000L, 60_000L, 120_000L, 180_000L,
         )
-        val PHOTO_TIME = SimpleDateFormat("dd.MM HH:mm", Locale.US)
+
+        /** Immutable and thread-safe: photo captions are written from two lanes at once. */
+        val PHOTO_TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("dd.MM HH:mm", Locale.US)
 
         /** A bot may upload 50 MB; anything larger is refused outright. */
         const val MAX_UPLOAD_MB = 49.0
@@ -1152,7 +1406,7 @@ class TelegramBot(
             /report [часов] — HTML-отчёт с картой и фото встреч
             /list — машины от уровня «наблюдение», /all — вообще все
             /find текст — поиск по номерам
-            /plate НОМЕР — карточка машины и фото встреч
+            /plate НОМЕР (или /card) — карточка машины и фото встреч
             /bl НОМЕР, /unbl НОМЕР, /blacklist — чёрный список
             /police НОМЕР, /unpolice НОМЕР, /policelist — полиция: кричит как чёрный список
             /ignore НОМЕР, /unignore НОМЕР, /ignored — «свои» машины, которые не тревожат
@@ -1181,12 +1435,13 @@ class TelegramBot(
             <b>1. Что нужно, чтобы дошло до ХВОСТА</b>
             Все пути к «хвосту» требуют минимум <b>один общий поворот</b>. По прямой дороге
             хвостом не станет никогда — максимум «подозрение».
-            Общий поворот засчитывается, если машина была видна <b>за 60 с до</b> поворота
-            и снова <b>в течение 120 с после</b> него.
+            Общий поворот засчитывается, если машина была видна <b>за 60 с до</b> начала поворота
+            и снова <b>в течение 120 с после</b> его конца.
 
             Быстрее всего сработает так:
             • <b>3 общих поворота</b> → ХВОСТ сразу
             • 2 поворота + <b>5 минут</b> рядом → ХВОСТ
+            • 2 поворота + встречи в <b>двух поездках в разных местах</b> → ХВОСТ
             • 2 раза потерялась и вернулась + 1 поворот → ХВОСТ
 
             Повороты считаются по GPS-курсу. На медленном развороте с полной остановкой
@@ -1194,19 +1449,21 @@ class TelegramBot(
 
             <b>2. Ступени до этого</b>
             🟡 наблюдение — 3 распознавания + 1 мин рядом или 700 м
-            🟠 подозрение — 2 поворота, либо 3 мин + 2.5 км (по прямой — 8 км)
+            🟠 подозрение — 2 поворота, либо 3 мин + 2.5 км (по прямой — 8 км), либо 2 поездки в разных местах
             🔴 хвост — см. выше
             ⛔️ чёрный список — вручную кнопкой или /bl НОМЕР
+            Без GPS считается только время: 3 мин и 6 чтений — наблюдение, 10 мин — подозрение.
 
-            <b>3. Чтобы услышать «СНОВА РЯДОМ»</b>
-            Машина должна пропасть из виду <b>дольше 2 минут</b>, и только потом вернуться.
-            Если она всё время висит сзади — тревога будет <b>одна</b>, на повышение уровня.
-            Это не поломка, это чтобы предупреждение не превратилось в бубнёж.
-            Потолок — <b>одна тревога на машину в 8 минут</b>.
+            <b>3. Как часто говорит</b>
+            ХВОСТ и чёрный список — голосом на каждое распознавание, не чаще раза в 12 с,
+            пока машина в кадре; в чат «📍 ВСЁ ЕЩЁ СЗАДИ» не чаще раза в 2 минуты.
+            ПОДОЗРЕНИЕ и НАБЛЮДЕНИЕ — один раз за отрезок контакта; отрезок рвётся,
+            когда машина пропадает из виду <b>дольше 45 с</b>. Потолок — одна тревога в 8 минут.
+            Настройка «после N встреч» даёт тревогу на N-й отдельной встрече, даже без повышения уровня.
 
             <b>4. Что произойдёт при «хвосте»</b>
             • голос вслух: уровень, номер по буквам, марка и цвет, улики
-            • сообщение с фото и кнопками «в чёрный список» / «игнорировать»
+            • сообщение с кнопками «в чёрный список» / «игнорировать», следом фото
             • все фото встреч + карта маршрута
             • <b>начинается видеозапись</b> (нарезкой по 90 с)
 

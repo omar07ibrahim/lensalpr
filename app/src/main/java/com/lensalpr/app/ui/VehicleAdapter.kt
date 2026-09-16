@@ -94,6 +94,10 @@ class VehicleAdapter(
             override fun areItemsTheSame(oldItem: VehicleCard, newItem: VehicleCard): Boolean =
                 oldItem.plate == newItem.plate
 
+            // The bitmap is compared by identity on purpose: a new frame is a new object, and a
+            // pixel comparison of two thumbnails per diff is exactly the cost this callback exists
+            // to avoid.
+            @Suppress("DiffUtilEquals")
             override fun areContentsTheSame(oldItem: VehicleCard, newItem: VehicleCard): Boolean =
                 oldItem.sightings == newItem.sightings &&
                     oldItem.ocrScore == newItem.ocrScore &&

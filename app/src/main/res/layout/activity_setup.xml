@@ -408,7 +408,7 @@
                     android:id="@+id/switchDirect"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Direct physical camera binding (experimental)"
+                    android:text="@string/recognition_direct_physical"
                     android:textColor="@color/text_primary"
                     android:textSize="13sp" />
             </LinearLayout>

@@ -61,8 +61,13 @@ class VehicleRegistry(
 
     enum class Change { NONE, PENDING, CONFIRMED, UPDATED }
 
-    /** The change plus the affected card, so callers do not have to search the snapshot. */
-    data class SubmitResult(val change: Change, val card: VehicleCard?)
+    /**
+     * The change plus the affected card, so callers do not have to search the snapshot.
+     *
+     * [score] is the confidence of the read that produced this result — what the encounter photo
+     * taken from this very frame is worth — as opposed to the card's best score ever.
+     */
+    data class SubmitResult(val change: Change, val card: VehicleCard?, val score: Float = 0f)
 
     private class TrackConsensus {
         val counts = HashMap<String, Int>()
@@ -107,6 +112,8 @@ class VehicleRegistry(
         val lenses: LinkedHashSet<String>,
         /** How many reads voted for the spelling this card currently carries. */
         var votes: Int,
+        /** Confidence of the classifier answer the make, model and year were taken from. */
+        var attributeConfidence: Float = 0f,
     )
 
     private val consensus = HashMap<Int, TrackConsensus>()
@@ -128,13 +135,14 @@ class VehicleRegistry(
         // unrelated cars. Such a reading can still tell us about a plate, and nothing more.
         val runtime = recognition.peek(job.trackId)
             ?: return submitOrphan(job, outcome, nowMs)
-        runtime.inFlight = false
+        // A crop read late from disk says nothing about the crop the scheduler is waiting for
+        // now; only the live job may release its own track.
+        if (!job.deferred) runtime.inFlight = false
 
         val state = consensus.getOrPut(job.trackId) { TrackConsensus() }
-        mergeCar(state, outcome)
+        val reading = selectReading(outcome, minScore, job)
+        mergeCar(state, outcome, reading)
         state.car?.makeModel?.let { runtime.makeModel = it }
-
-        val reading = selectReading(outcome, minScore)
 
         if (reading == null) {
             // Even a plate-less frame can carry make/model, and its crop may be the only image the
@@ -182,8 +190,11 @@ class VehicleRegistry(
             if (entry != null) {
                 touch(entry, job, winner, state, nowMs, betterFrame, votes)
                 state.confirmed = entry.plate
+                // The box label follows the card: a spelling refined by later votes used to stay
+                // on the frame as the old reading while the list showed the corrected one.
+                runtime.confirmedPlate = entry.plate
                 recycleUnused(state, job, entry)
-                return SubmitResult(Change.UPDATED, entry.toCard())
+                return SubmitResult(Change.UPDATED, entry.toCard(), reading.recognitionScore)
             }
         }
 
@@ -194,7 +205,7 @@ class VehicleRegistry(
             } else {
                 recycle(job.thumbnail)
             }
-            return SubmitResult(Change.PENDING, null)
+            return SubmitResult(Change.PENDING, null, reading.recognitionScore)
         }
 
         // Confirmed.
@@ -204,9 +215,12 @@ class VehicleRegistry(
         state.candidateThumb = null
 
         // The same car read a minute ago under another lens must land on its own card, even if that
-        // read spelled one character differently.
+        // read spelled one character differently — unless that card belongs to a car that is in
+        // the picture *right now* on another track. Two vehicles side by side with plates one
+        // confusable character apart are two vehicles, and folding one into the other hid the
+        // very car the operator would have wanted to see.
         val existing = vehicles[winner.text] ?: vehicles.values.firstOrNull {
-            PlateSimilarity.similar(it.plate, winner.text)
+            PlateSimilarity.similar(it.plate, winner.text) && !confirmedOnAnotherLiveTrack(it.plate, job.trackId)
         }
         if (existing != null) {
             existing.lastSeenMs = nowMs
@@ -224,26 +238,31 @@ class VehicleRegistry(
             applyAttributes(existing, state.car ?: winner.car)
             state.confirmed = existing.plate
             runtime.confirmedPlate = existing.plate
-            return SubmitResult(Change.UPDATED, existing.toCard())
+            return SubmitResult(Change.UPDATED, existing.toCard(), reading.recognitionScore)
         }
 
         state.confirmed = winner.text
         runtime.confirmedPlate = winner.text
         val entry = createEntry(winner, state.car ?: winner.car, thumbnail, job.lensLabel, nowMs, votes)
         trim()
-        return SubmitResult(Change.CONFIRMED, entry.toCard())
+        return SubmitResult(Change.CONFIRMED, entry.toCard(), reading.recognitionScore)
     }
+
+    /** True when a *different* live track has this plate as its confirmed reading. */
+    private fun confirmedOnAnotherLiveTrack(plate: String, trackId: Int): Boolean =
+        consensus.any { (id, state) -> id != trackId && state.confirmed == plate }
 
     /**
      * A reading whose track no longer exists — a crop that waited too long in the queue, or one
      * recovered from disk, possibly from a previous run.
      *
      * It cannot join any track's consensus, but the pixels were real and the plate is worth having.
-     * So it either corroborates a card we already hold, or it accumulates against its own plate
-     * until it has met the same bar a live vehicle has to meet.
+     * So it either corroborates a card we already hold, joins the votes its own track parked when
+     * the lens rotated, or it accumulates against its own plate until it has met the same bar a
+     * live vehicle has to meet.
      */
     private fun submitOrphan(job: OcrJob, outcome: AlprOutcome, nowMs: Long): SubmitResult {
-        val reading = selectReading(outcome, minScore)
+        val reading = selectReading(outcome, minScore, job)
         if (reading == null) {
             recycle(job.thumbnail)
             return SubmitResult(Change.NONE, null)
@@ -260,11 +279,53 @@ class VehicleRegistry(
             if (renamed || reading.recognitionScore > existing.ocrScore) {
                 existing.ocrScore = reading.recognitionScore
                 existing.thumbnail = job.thumbnail
-            } else {
-                recycle(job.thumbnail)
             }
+            // The newest look at the car, published, so the encounter photo is a picture of this
+            // meeting; the frame it replaces goes to the GC like every other published bitmap.
+            existing.latestThumbnail = job.thumbnail
             applyAttributes(existing, reading.car)
-            return SubmitResult(Change.UPDATED, existing.toCard())
+            return SubmitResult(Change.UPDATED, existing.toCard(), reading.recognitionScore)
+        }
+
+        // The track this crop came from may have ended a moment ago, taking its votes to the pool.
+        // A read that was in flight when the lens rotated is the last of those votes, not the first
+        // of a new tally — and it is very often the one that tips the car over the threshold.
+        val parkedIndex = pool.indexOfFirst { PlateSimilarity.similar(it.plate, reading.text) }
+        if (parkedIndex >= 0) {
+            val parked = pool[parkedIndex]
+            val label = parked.plate
+            val count = (parked.state.counts[label] ?: 0) + 1
+            val history = parked.state.variants.getOrPut(label) { ArrayList(PlateFusion.MAX_READINGS) }
+            history += reading
+            if (history.size > PlateFusion.MAX_READINGS) history.removeAt(0)
+            val fused = PlateFusion.fuse(history)
+            val winner = fused?.reading ?: reading
+            val betterFrame = reading.recognitionScore >= parked.state.bestScore
+            if (count < requiredMatches) {
+                parked.state.counts[label] = count
+                if (betterFrame) {
+                    recycle(parked.state.candidateThumb)
+                    parked.state.candidateThumb = job.thumbnail
+                    parked.state.bestScore = reading.recognitionScore
+                } else {
+                    recycle(job.thumbnail)
+                }
+                return SubmitResult(Change.PENDING, null, reading.recognitionScore)
+            }
+            pool.removeAt(parkedIndex)
+            val best = if (betterFrame) job.thumbnail else parked.state.candidateThumb ?: job.thumbnail
+            if (best !== parked.state.candidateThumb) recycle(parked.state.candidateThumb)
+            val entry = createEntry(
+                winner,
+                parked.state.car ?: reading.car,
+                best,
+                job.lensLabel,
+                nowMs,
+                fused?.support ?: count,
+            )
+            entry.latestThumbnail = job.thumbnail
+            trim()
+            return SubmitResult(Change.CONFIRMED, entry.toCard(), reading.recognitionScore)
         }
 
         // Aged out rather than merely capped: a tally kept from an hour ago is not corroboration,
@@ -277,12 +338,12 @@ class VehicleRegistry(
         if (orphanCounts.size > MAX_ORPHAN_GROUPS) orphanCounts.clear()
         if (count < requiredMatches) {
             recycle(job.thumbnail)
-            return SubmitResult(Change.PENDING, null)
+            return SubmitResult(Change.PENDING, null, reading.recognitionScore)
         }
         orphanCounts.remove(group)
         val entry = createEntry(reading, reading.car, job.thumbnail, job.lensLabel, nowMs, count)
         trim()
-        return SubmitResult(Change.CONFIRMED, entry.toCard())
+        return SubmitResult(Change.CONFIRMED, entry.toCard(), reading.recognitionScore)
     }
 
     private fun createEntry(
@@ -311,6 +372,7 @@ class VehicleRegistry(
             sightings = 1,
             lenses = linkedSetOf(lens),
             votes = votes,
+            attributeConfidence = car?.makeModelConfidence ?: 0f,
         )
         vehicles[reading.text] = entry
         return entry
@@ -372,15 +434,14 @@ class VehicleRegistry(
         if (state.counts.isNotEmpty()) return
         val index = pool.indexOfFirst { PlateSimilarity.similar(it.plate, reading.text) }
         if (index < 0) return
-        val parked = pool.removeAt(index).state
+        val parked = pool[index].state
         // Two different cars can carry near-identical plates; if the classifiers disagree about
-        // what they are looking at, the votes belong to neither.
+        // what they are looking at, the votes belong to neither — but they stay parked for the
+        // car they do belong to, which may be the next track along.
         val here = state.car?.make
         val there = parked.car?.make
-        if (here != null && there != null && here != there) {
-            recycle(parked.candidateThumb)
-            return
-        }
+        if (here != null && there != null && here != there) return
+        pool.removeAt(index)
         state.counts.putAll(parked.counts)
         state.variants.putAll(parked.variants)
         if (state.car == null) state.car = parked.car
@@ -415,27 +476,55 @@ class VehicleRegistry(
         lenses = lenses.toList(),
     )
 
-    /** Operator correction: move a published card onto another plate. */
+    /**
+     * Operator correction: move a published card onto another plate.
+     *
+     * Every live track that had confirmed the old spelling follows the card, or the next read of
+     * that track would find its old consensus above the threshold with no card under it — and
+     * create the card the operator just corrected away, right next to the corrected one.
+     */
     fun rename(from: String, to: String, display: String): Boolean {
         val entry = vehicles.remove(from) ?: return false
         val existing = vehicles[to]
         if (existing != null) {
             existing.sightings += entry.sightings
             existing.lenses += entry.lenses
-            existing.lastSeenMs = maxOf(existing.lastSeenMs, entry.lastSeenMs)
             if (entry.ocrScore > existing.ocrScore) {
                 existing.ocrScore = entry.ocrScore
                 existing.thumbnail = entry.thumbnail
             }
+            if (entry.lastSeenMs > existing.lastSeenMs) {
+                existing.lastSeenMs = entry.lastSeenMs
+                existing.latestThumbnail = entry.latestThumbnail ?: existing.latestThumbnail
+            }
             existing.votes = Int.MAX_VALUE
-            return true
+        } else {
+            entry.plate = to
+            entry.displayPlate = display
+            // The operator outranks any amount of voting.
+            entry.votes = Int.MAX_VALUE
+            vehicles[to] = entry
         }
-        entry.plate = to
-        entry.displayPlate = display
-        // The operator outranks any amount of voting.
-        entry.votes = Int.MAX_VALUE
-        vehicles[to] = entry
+        rekeyLiveTracks(from, to)
         return true
+    }
+
+    /** Points every consensus and runtime that had confirmed [from] at [to]. */
+    private fun rekeyLiveTracks(from: String, to: String) {
+        consensus.values.forEach { state ->
+            if (state.confirmed == from) {
+                state.confirmed = to
+                // The old spelling's votes would re-confirm it on the next read; they now stand
+                // behind the corrected one.
+                val moved = state.counts.remove(from)
+                if (moved != null) state.counts[to] = maxOf(moved, state.counts[to] ?: 0)
+                state.variants.remove(from)?.let { history -> state.variants.getOrPut(to) { ArrayList() }.addAll(history) }
+            }
+        }
+        recognition.forEach { _, runtime ->
+            if (runtime.confirmedPlate == from) runtime.confirmedPlate = to
+            if (runtime.pendingPlate == from) runtime.pendingPlate = to
+        }
     }
 
     fun clear() {
@@ -465,8 +554,9 @@ class VehicleRegistry(
             entry.ocrScore = reading.recognitionScore
             if (betterFrame) entry.thumbnail = job.thumbnail
         }
-        // Evidence wants the latest look at the car, not the luckiest one.
-        if (betterFrame) entry.latestThumbnail = job.thumbnail
+        // Evidence wants the latest look at the car, not the luckiest one — every time, not only
+        // when the frame also happened to be the best read.
+        entry.latestThumbnail = job.thumbnail
         applyAttributes(entry, state.car ?: reading.car)
     }
 
@@ -498,6 +588,7 @@ class VehicleRegistry(
             )
         }
         if (keepExisting) return false
+        val previous = entry.plate
         vehicles.remove(entry.plate)
         // The winning spelling may already have a card of its own — two tracks of the same car
         // converging. The other card is folded *into this one* rather than the other way round: the
@@ -518,6 +609,12 @@ class VehicleRegistry(
             if (collision.lastSeenMs >= entry.lastSeenMs && collision.latestThumbnail != null) {
                 entry.latestThumbnail = collision.latestThumbnail
             }
+            if (collision.attributeConfidence > entry.attributeConfidence) {
+                entry.make = collision.make
+                entry.model = collision.model
+                entry.year = collision.year
+                entry.attributeConfidence = collision.attributeConfidence
+            }
             entry.make = entry.make ?: collision.make
             entry.model = entry.model ?: collision.model
             entry.color = entry.color ?: collision.color
@@ -528,6 +625,7 @@ class VehicleRegistry(
         entry.displayPlate = reading.display
         entry.votes = votes
         vehicles[entry.plate] = entry
+        rekeyLiveTracks(previous, entry.plate)
         return true
     }
 
@@ -547,19 +645,36 @@ class VehicleRegistry(
         state.candidateThumb = null
     }
 
+    /**
+     * Make, model and year travel as one answer from one classifier call; filling them in one
+     * field at a time assembled cars that do not exist ("Toyota X5"). A surer answer replaces the
+     * whole group; colour and body are filled once, because the classifier gives no confidence
+     * for them to compare.
+     */
     private fun applyAttributes(entry: VehicleEntry, car: CarInfo?) {
         if (car == null) return
-        if (entry.make == null) entry.make = car.make
-        if (entry.model == null) entry.model = car.model
-        if (entry.year == null) entry.year = car.year
+        val hasMakeModel = car.make != null || car.model != null
+        val empty = entry.make == null && entry.model == null
+        if (hasMakeModel && (empty || car.makeModelConfidence > entry.attributeConfidence + ATTRIBUTE_MARGIN)) {
+            entry.make = car.make
+            entry.model = car.model
+            entry.year = car.year ?: entry.year
+            entry.attributeConfidence = car.makeModelConfidence
+        }
         if (entry.color == null) entry.color = car.color
         if (entry.bodyStyle == null) entry.bodyStyle = car.bodyStyle
     }
 
-    private fun mergeCar(state: TrackConsensus, outcome: AlprOutcome) {
-        val candidates = ArrayList<CarInfo>(outcome.cars)
-        outcome.plates.mapNotNullTo(candidates) { it.car }
-        val best = candidates.maxByOrNull { it.makeModelConfidence } ?: return
+    /**
+     * The classifier answer that belongs to the plate this result is about.
+     *
+     * A crop can hold two cars, and the engine attaches a `car` to each plate it read. Taking the
+     * most confident make/model anywhere in the crop labelled the tracked car with its
+     * neighbour's badge; the reading's own car comes first, the anonymous cars of the crop only
+     * when the plate carried none.
+     */
+    private fun mergeCar(state: TrackConsensus, outcome: AlprOutcome, reading: PlateReading?) {
+        val best = reading?.car ?: outcome.cars.maxByOrNull { it.makeModelConfidence } ?: return
         val current = state.car
         if (current == null || best.makeModelConfidence > current.makeModelConfidence) {
             state.car = best
@@ -583,16 +698,44 @@ class VehicleRegistry(
         private const val POOL_TTL_MS = 8_000L
         private const val MAX_POOLED = 24
 
+        /** A classifier has to be this much surer before it may overwrite an earlier make/model. */
+        private const val ATTRIBUTE_MARGIN = 8f
+
+        /**
+         * Share of a whole-vehicle crop, on each side, that is padding around the detector's box.
+         * A plate centred inside that strip sits on the bumper of the car alongside, not on ours.
+         */
+        private const val EDGE_SHARE = FrameProcessor.CROP_MARGIN / (1f + 2f * FrameProcessor.CROP_MARGIN)
+
         /**
          * The one reading a result is judged by.
          *
          * Everything downstream — the consensus vote, the card, and the remembered plate position —
          * has to agree on which of several detected plates the result is about, or the anchor ends
          * up pointing at the neighbouring car's plate while the card records this one's.
+         *
+         * Among the plates that clear the score floor, the ones inside the tracked vehicle's own
+         * box come first: a whole-car crop carries a margin around the detector box, and the most
+         * confident read in the crop used to win even when it sat in that margin, on the next
+         * car's bumper. Only when nothing is inside does the best read anywhere count.
          */
-        fun selectReading(outcome: AlprOutcome, minScore: Float): PlateReading? = outcome.plates
-            .filter { it.recognitionScore >= minScore }
-            .maxByOrNull { it.recognitionScore }
+        fun selectReading(outcome: AlprOutcome, minScore: Float, job: OcrJob? = null): PlateReading? {
+            val eligible = outcome.plates.filter { it.recognitionScore >= minScore }
+            if (eligible.isEmpty()) return null
+            if (job == null || job.narrow || job.width <= 0 || job.height <= 0 || eligible.size == 1) {
+                return eligible.maxByOrNull { it.recognitionScore }
+            }
+            val insetX = job.width * EDGE_SHARE
+            val insetY = job.height * EDGE_SHARE
+            val inside = eligible.filter { reading ->
+                val box = reading.box ?: return@filter true
+                val centreX = box.centerX()
+                val centreY = box.centerY()
+                centreX >= insetX && centreX <= job.width - insetX &&
+                    centreY >= insetY && centreY <= job.height - insetY
+            }
+            return inside.ifEmpty { eligible }.maxByOrNull { it.recognitionScore }
+        }
     }
 
     /** Only unpublished bitmaps are recycled; anything the list may still draw is left to the GC. */

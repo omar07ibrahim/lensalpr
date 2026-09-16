@@ -81,7 +81,21 @@ class SetupActivity : AppCompatActivity() {
         binding.btnReset.setOnClickListener {
             PreferenceManager.getDefaultSharedPreferences(this).edit { clear() }
             rows.clear()
+            // The connection fields are only ever filled while empty, so a reset that left them
+            // alone kept the old token and wrote it straight back on the next start.
+            binding.editToken.setText("")
+            binding.editOwner.setText("")
             refresh()
+        }
+        // The screen is drawn edge to edge on this target; without this the title sits under the
+        // status bar and the start button under the navigation bar.
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
+            val bars = insets.getInsets(
+                androidx.core.view.WindowInsetsCompat.Type.systemBars() or
+                    androidx.core.view.WindowInsetsCompat.Type.displayCutout(),
+            )
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
         }
         binding.btnWipe.setOnClickListener { confirmWipe() }
         binding.btnStart.setOnClickListener { start() }

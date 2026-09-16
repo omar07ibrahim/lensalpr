@@ -1,6 +1,7 @@
 package com.lensalpr.app.alpr
 
 import android.content.Context
+import android.content.res.AssetManager
 import android.os.SystemClock
 import android.util.Log
 import com.lensalpr.app.settings.ScanConfig
@@ -67,6 +68,27 @@ object AlprEngine {
     /** Engine settings the current native instance was initialized with. */
     @Volatile
     private var activeConfig: String? = null
+
+    /**
+     * Whether the SDK holds a native instance at all — regardless of whether that instance is
+     * still usable.
+     *
+     * Kept apart from [activeConfig] on purpose. The runtime limit clears the config so that a
+     * plain [initialize] counts as a repair, but the native side is still initialized and its
+     * `init` short-circuits on an existing instance: without an explicit `deInit` first the "new"
+     * engine was the same exhausted one, reported READY, and refused the next frame.
+     */
+    @Volatile
+    private var nativeInitialized = false
+
+    /**
+     * A configuration requested while another initialization was still running.
+     *
+     * The setup screen can change native parameters and reopen the scanner before the previous
+     * `init` returns; returning early from [initialize] then left the old parameters in force and
+     * the new screen's worker running against an engine it never asked for.
+     */
+    private var pendingRequested: String? = null
 
     /** Whether only the local plate layout is accepted; set from the scan configuration. */
     @Volatile
@@ -139,68 +161,101 @@ object AlprEngine {
         val requested = engineConfig(config).toString()
         strictLatvia = config.strictPlateFormat
         synchronized(stateLock) {
-            if (status.state == State.INITIALIZING) return
-            // isReady, not state: after the runtime limit the state is still READY and only the
-            // flag says the engine is dead. Comparing the state alone made every repair attempt —
-            // including recreating the whole activity — return here without touching the engine.
+            if (status.state == State.INITIALIZING) {
+                // Remembered, not dropped: the running init finishes with the parameters it was
+                // given and then immediately applies these.
+                if (force || requested != activeConfig) pendingRequested = requested
+                return
+            }
             if (!force && status.isReady && activeConfig == requested) return
             if (force) activeConfig = null
             // A fresh Status, never a copy: the copy would carry runtimeLimited into the new
             // instance and lock it out again before it has read a single frame.
             publish(Status(State.INITIALIZING, limitHits = limitHits))
         }
-        initExecutor.execute {
-            val next = runCatching {
-                engineLock.withLock {
-                    if (activeConfig != null || force) {
-                        Log.i(TAG, if (force) "forced engine restart" else "engine settings changed; restarting")
-                        runCatching { AlprSdk.deInit()?.delete() }
-                        activeConfig = null
-                    }
-                    if (!activated) {
-                        val activation = AlprSdk.setActivation(ACTIVATION_KEY)
-                        if (activation != 0) {
-                            return@withLock Status(
-                                State.ERROR,
-                                code = activation,
-                                message = "activation failed",
-                                limitHits = limitHits,
-                            )
-                        }
-                        activated = true
-                    }
-                    val result = AlprSdk.init(assets, requested, null)
-                    try {
-                        if (result.code() == 0) {
-                            Log.i(TAG, "engine ready: ${result.phrase()}")
-                            activeConfig = requested
-                            // Anything still in flight from the previous instance can no longer
-                            // report a limit against this one.
-                            generation += 1
-                            readySinceMs = SystemClock.elapsedRealtime()
-                            runCatching {
-                                AlprSdk.warmUp(SDK_IMAGE_TYPE.ULTALPR_SDK_IMAGE_TYPE_RGBA32)
-                                    ?.delete()
-                            }
-                            Status(State.READY, limitHits = limitHits)
-                        } else {
-                            Log.e(TAG, "engine init failed: ${result.code()} ${result.phrase()}")
-                            Status(State.ERROR, result.code(), result.phrase(), limitHits = limitHits)
-                        }
-                    } finally {
-                        result.delete()
-                    }
-                }
-            }.getOrElse { error ->
-                Log.e(TAG, "engine init crashed", error)
-                Status(
-                    State.ERROR,
-                    message = error.message ?: error.javaClass.simpleName,
-                    limitHits = limitHits,
-                )
+        initExecutor.execute { runInit(assets, requested, force) }
+    }
+
+    /** One initialization on the init thread, followed by whatever was requested meanwhile. */
+    private fun runInit(assets: AssetManager, requested: String, force: Boolean) {
+        var next = performInit(assets, requested, force)
+        while (true) {
+            val pending = synchronized(stateLock) {
+                val queued = pendingRequested
+                pendingRequested = null
+                if (queued != null && (queued != activeConfig || next.state != State.READY)) queued else null
             }
-            publish(next)
+            if (pending == null) break
+            Log.i(TAG, "settings changed during initialization; applying the newer ones")
+            next = performInit(assets, pending, force = true)
         }
+        publish(next)
+    }
+
+    private fun performInit(assets: AssetManager, requested: String, force: Boolean): Status =
+        runCatching {
+            engineLock.withLock {
+                if (nativeInitialized) {
+                    Log.i(TAG, if (force) "forced engine restart" else "engine settings changed; restarting")
+                    runCatching { AlprSdk.deInit()?.delete() }
+                    nativeInitialized = false
+                    activeConfig = null
+                }
+                if (!activated) {
+                    val activation = AlprSdk.setActivation(ACTIVATION_KEY)
+                    if (activation != 0) {
+                        return@withLock Status(
+                            State.ERROR,
+                            code = activation,
+                            message = "activation failed",
+                            limitHits = limitHits,
+                        )
+                    }
+                    activated = true
+                }
+                val result = AlprSdk.init(assets, requested, null)
+                try {
+                    if (result.code() == 0) {
+                        Log.i(TAG, "engine ready: ${result.phrase()}")
+                        nativeInitialized = true
+                        activeConfig = requested
+                        // Anything still in flight from the previous instance can no longer
+                        // report a limit against this one.
+                        generation += 1
+                        readySinceMs = SystemClock.elapsedRealtime()
+                        warmUp()
+                        Status(State.READY, limitHits = limitHits)
+                    } else {
+                        Log.e(TAG, "engine init failed: ${result.code()} ${result.phrase()}")
+                        Status(State.ERROR, result.code(), result.phrase(), limitHits = limitHits)
+                    }
+                } finally {
+                    result.delete()
+                }
+            }
+        }.getOrElse { error ->
+            Log.e(TAG, "engine init crashed", error)
+            Status(
+                State.ERROR,
+                message = error.message ?: error.javaClass.simpleName,
+                limitHits = limitHits,
+            )
+        }
+
+    /**
+     * Pays the lazy model loading up front. Best effort: on some builds of the vendor AAR the
+     * Java wrapper and the native symbol disagree and the call cannot even be linked. That is
+     * worth a line in the log, not a failed start — the first real frame simply pays instead.
+     */
+    private fun warmUp() {
+        val outcome = runCatching {
+            val result = AlprSdk.warmUp(SDK_IMAGE_TYPE.ULTALPR_SDK_IMAGE_TYPE_RGBA32)
+            val code = result?.code() ?: -1
+            result?.delete()
+            code
+        }
+        outcome.onFailure { error -> Log.w(TAG, "warm-up unavailable: ${error.javaClass.simpleName}: ${error.message}") }
+        outcome.onSuccess { code -> if (code != 0) Log.w(TAG, "warm-up returned $code") }
     }
 
     /**
@@ -244,42 +299,7 @@ object AlprEngine {
         // isReady rather than the state: a runtime-limited engine would otherwise report success
         // here and the benchmark would silently measure an engine that refuses every frame.
         if (status.isReady && activeConfig == requested) return true
-        val next = runCatching {
-            engineLock.withLock {
-                if (activeConfig != null) {
-                    runCatching { AlprSdk.deInit()?.delete() }
-                    activeConfig = null
-                }
-                if (!activated) {
-                    val activation = AlprSdk.setActivation(ACTIVATION_KEY)
-                    if (activation != 0) {
-                        return@withLock Status(
-                            State.ERROR,
-                            code = activation,
-                            message = "activation failed",
-                            limitHits = limitHits,
-                        )
-                    }
-                    activated = true
-                }
-                val result = AlprSdk.init(assets, requested, null)
-                try {
-                    if (result.code() == 0) {
-                        activeConfig = requested
-                        generation += 1
-                        readySinceMs = SystemClock.elapsedRealtime()
-                        Status(State.READY, limitHits = limitHits)
-                    } else {
-                        Status(State.ERROR, result.code(), result.phrase(), limitHits = limitHits)
-                    }
-                } finally {
-                    result.delete()
-                }
-            }
-        }.getOrElse { error ->
-            Log.e(TAG, "blocking init failed", error)
-            Status(State.ERROR, message = error.message, limitHits = limitHits)
-        }
+        val next = performInit(assets, requested, force = true)
         publish(next)
         return next.state == State.READY
     }
@@ -303,6 +323,9 @@ object AlprEngine {
         // declared out of entitlement, not whichever instance happens to be current on return.
         val gen = generation
         return engineLock.withLock {
+            // Re-checked under the lock: an initialization that ran between the check above and
+            // taking the lock has replaced the instance this frame was meant for.
+            if (!status.isReady) return AlprOutcome.failure(-1, "engine not ready", 0L)
             val started = SystemClock.elapsedRealtimeNanos()
             var result: AlprResult? = null
             try {
@@ -342,7 +365,8 @@ object AlprEngine {
      * Under [stateLock] and guarded by the generation, because this is called from the recognition
      * thread while another thread may already be building a replacement: without both, a verdict
      * from the instance that just died would land on the one that just came up and lock the engine
-     * out permanently. [activeConfig] is cleared so a plain `initialize` is enough to repair it.
+     * out permanently. [activeConfig] is cleared so a plain `initialize` is enough to repair it;
+     * [nativeInitialized] is deliberately left set so that repair tears the dead instance down.
      */
     private fun markRuntimeLimited(gen: Int) {
         synchronized(stateLock) {

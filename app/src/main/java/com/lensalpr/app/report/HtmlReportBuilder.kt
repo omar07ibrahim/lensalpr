@@ -7,8 +7,9 @@ import com.lensalpr.app.data.TrackingStore
 import com.lensalpr.app.follow.ThreatLevel
 import com.lensalpr.app.track.TripTracker
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
@@ -66,7 +67,7 @@ class HtmlReportBuilder(
     fun build(options: Options): File {
         // Three threads can be building reports at once and the stamp has minute resolution: an
         // alert's own report and a tap on the report button would otherwise write the same file.
-        val stamp = FILE_STAMP.format(Date(options.untilMs))
+        val stamp = FILE_STAMP.format(zoned(options.untilMs))
         val unique = (System.nanoTime() % 100_000L).toString().padStart(5, '0')
         val target = File(context.cacheDir, "lensalpr_${stamp}_$unique.html")
 
@@ -74,13 +75,15 @@ class HtmlReportBuilder(
             listOfNotNull(store.vehicle(options.plate))
         } else {
             store.vehiclesSeenSince(options.sinceMs)
-                .filter { it.level >= options.minLevel.rank || it.blacklisted }
+                .filter { it.level >= options.minLevel.rank || it.blacklisted || it.police }
         }
+        // Our own route belongs to the trips that overlap the window, whether or not a single
+        // plate was read on them: a drive with nobody behind us still has a map and a distance.
         val tripIds = options.tripIds.ifEmpty {
             if (options.plate != null) {
-                store.encounters(options.plate, options.sinceMs).map { it.tripId }.distinct()
+                store.encounters(options.plate, options.sinceMs, options.untilMs).map { it.tripId }.distinct()
             } else {
-                store.encountersSince(options.sinceMs).map { it.tripId }.distinct()
+                store.tripsBetween(options.sinceMs, options.untilMs)
             }
         }
 
@@ -90,34 +93,45 @@ class HtmlReportBuilder(
         val vehiclesJson = JSONArray()
 
         vehicles.forEach { vehicle ->
-            val encounters = store.encounters(vehicle.plate, options.sinceMs)
+            val encounters = store.encounters(vehicle.plate, options.sinceMs, options.untilMs)
             if (encounters.isEmpty()) return@forEach
-            val level = if (vehicle.blacklisted) {
-                ThreatLevel.BLACKLIST
-            } else {
-                ThreatLevel.of(vehicle.level)
+            val level = when {
+                // Dismissed by the operator: whatever the list or the level says, it is not a
+                // tail in this report.
+                vehicle.ignored -> ThreatLevel.IGNORE
+                vehicle.blacklisted -> ThreatLevel.BLACKLIST
+                else -> ThreatLevel.of(minOf(vehicle.level, ThreatLevel.TAIL.rank))
             }
             counts[level.rank] += 1
             earliest = minOf(earliest, encounters.first().startedAt)
 
-            // The photo budget has to be spent on the most recent meetings. `encounters` is
-            // oldest-first, so capping by position embedded the *oldest* pictures and dropped
-            // exactly the ones that describe what is happening now — on a car met all week the
-            // report showed Monday and nothing since.
-            val withPhotos = encounters.withIndex()
-                .filter { !it.value.photo.isNullOrBlank() }
-                .takeLast(options.maxPhotosPerVehicle)
-                .map { it.index }
-                .toSet()
-            var embedded = 0
+            // The photo budget has to be spent on the most recent meetings. Both the per-vehicle
+            // cap and the global byte budget are therefore consumed newest first; the cards are
+            // still laid out in the order the meetings happened.
+            val embedded = HashMap<Long, String>()
+            val skippedByBudget = HashSet<Long>()
+            encounters.asReversed()
+                .filter { !it.photo.isNullOrBlank() }
+                .take(options.maxPhotosPerVehicle)
+                .forEach { encounter ->
+                    val path = encounter.photo ?: return@forEach
+                    if (photoBudget <= 0) {
+                        skippedByBudget += encounter.id
+                        return@forEach
+                    }
+                    val data = embedPhoto(File(path))
+                    if (data == null) return@forEach
+                    photoBudget -= data.length
+                    embedded[encounter.id] = data
+                }
             val encountersJson = JSONArray()
-            encounters.forEachIndexed { index, encounter ->
-                val photo = encounter.photo
-                    ?.takeIf { index in withPhotos && photoBudget > 0 }
-                    ?.let { path -> embedPhoto(File(path))?.also { photoBudget -= it.length } }
-                if (photo != null) embedded += 1
-                encountersJson.put(encounterJson(encounter, photo))
+            encounters.forEach { encounter ->
+                val photo = embedded[encounter.id]
+                val skipped = encounter.id in skippedByBudget ||
+                    (photo == null && !encounter.photo.isNullOrBlank() && File(encounter.photo).exists())
+                encountersJson.put(encounterJson(encounter, photo, skipped))
             }
+            val totalInWindow = store.countEncounters(vehicle.plate, options.sinceMs, options.untilMs)
 
             vehiclesJson.put(
                 JSONObject()
@@ -125,6 +139,7 @@ class HtmlReportBuilder(
                     .put("key", vehicle.plate)
                     .put("level", level.rank)
                     .put("levelName", levelName(level))
+                    .put("police", vehicle.police)
                     .put("makeModel", vehicle.makeModel ?: "")
                     .put("color", vehicle.color ?: "")
                     .put("country", vehicle.country ?: "")
@@ -135,11 +150,12 @@ class HtmlReportBuilder(
                     // Carrying all three numbers is what lets the card explain itself instead of
                     // looking like it lost pictures.
                     .put("encountersShown", encounters.size)
+                    .put("encountersInWindow", totalInWindow)
                     // Photos actually embedded, not photos that exist somewhere. A file the size
                     // budget skipped or that failed to load is a picture the reader cannot see,
                     // and counting it would reproduce the very mismatch this number exists to
                     // explain.
-                    .put("photosShown", embedded)
+                    .put("photosShown", embedded.size)
                     .put("turns", vehicle.sharedTurns)
                     .put("score", vehicle.bestScore.toInt())
                     // Zero means the row was created by a hand-typed mark and the camera has not
@@ -148,9 +164,9 @@ class HtmlReportBuilder(
                     // as evidence must not invent a first contact.
                     .put(
                         "first",
-                        if (vehicle.firstSeen > 0L) TIME.format(Date(vehicle.firstSeen)) else "—",
+                        if (vehicle.firstSeen > 0L) time(vehicle.firstSeen) else "—",
                     )
-                    .put("last", TIME.format(Date(vehicle.lastSeen)))
+                    .put("last", time(vehicle.lastSeen))
                     .put("lastMs", vehicle.lastSeen)
                     .put("ignored", vehicle.ignored)
                     .put(
@@ -171,31 +187,24 @@ class HtmlReportBuilder(
         val trackJson = JSONArray()
         var distanceM = 0.0
         tripIds.forEach { tripId ->
-            val points = store.trackPoints(tripId).filter { it.tMs >= options.sinceMs }
+            val points = store.trackPoints(tripId).filter { it.tMs in options.sinceMs..options.untilMs }
             if (points.size < 2) return@forEach
             val leg = JSONArray()
-            points.forEachIndexed { index, point ->
-                leg.put(JSONArray().put(round6(point.lat)).put(round6(point.lon)))
-                if (index > 0) {
-                    distanceM += TripTracker.distanceMeters(
-                        points[index - 1].lat,
-                        points[index - 1].lon,
-                        point.lat,
-                        point.lon,
-                    )
-                }
-            }
+            points.forEach { point -> leg.put(JSONArray().put(round6(point.lat)).put(round6(point.lon))) }
+            distanceM += legDistance(points)
             trackJson.put(leg)
         }
 
-        val turns = store.turnsSince(options.sinceMs)
+        // Only our own trips' turns: a dossier about one car must not carry every junction of
+        // every other drive, and the map must not be framed around them.
+        val turns = store.turnsBetween(options.sinceMs, options.untilMs, tripIds.takeIf { it.isNotEmpty() })
         val turnsJson = JSONArray()
         turns.forEach { turn ->
             turnsJson.put(
                 JSONObject()
                     .put("lat", round6(turn.lat))
                     .put("lon", round6(turn.lon))
-                    .put("t", TIME.format(Date(turn.tMs)))
+                    .put("t", time(turn.tMs))
                     .put("dir", directionName(turn.direction)),
             )
         }
@@ -230,8 +239,8 @@ class HtmlReportBuilder(
         }
 
         val payload = JSONObject()
-            .put("generated", TIME.format(Date(options.untilMs)))
-            .put("from", TIME.format(Date(windowFrom)))
+            .put("generated", time(options.untilMs))
+            .put("from", time(windowFrom))
             .put("windowFrom", windowFrom)
             .put("windowTo", options.untilMs)
             .put("stats", stats)
@@ -247,24 +256,54 @@ class HtmlReportBuilder(
         return target
     }
 
-    private fun encounterJson(encounter: EncounterRow, photo: String?): JSONObject = JSONObject()
+    /**
+     * Kilometres of one leg of our route.
+     *
+     * From the validated odometer stored with the points when the rows carry it: the live
+     * odometer already rejected the GPS hops, and summing raw point-to-point distances put them
+     * straight back — a parked phone produced a ten-kilometre report. Older rows without an
+     * odometer fall back to the sum, minus any step no car could have driven.
+     */
+    private fun legDistance(points: List<com.lensalpr.app.data.TrackPoint>): Double {
+        val odometer = points.map { it.odometerM }.filter { it.isFinite() }
+        if (odometer.size >= 2) return (odometer.max() - odometer.min()).coerceAtLeast(0.0)
+        var sum = 0.0
+        for (index in 1 until points.size) {
+            val step = TripTracker.distanceMeters(
+                points[index - 1].lat, points[index - 1].lon, points[index].lat, points[index].lon,
+            )
+            val seconds = (points[index].tMs - points[index - 1].tMs) / 1000.0
+            if (seconds > 0 && step / seconds > MAX_PLAUSIBLE_SPEED_MPS) continue
+            sum += step
+        }
+        return sum
+    }
+
+    private fun encounterJson(encounter: EncounterRow, photo: String?, skipped: Boolean): JSONObject = JSONObject()
         .put("id", encounter.id)
-        .put("start", TIME.format(Date(encounter.startedAt)))
-        .put("end", TIME.format(Date(encounter.endedAt)))
+        .put("start", time(encounter.startedAt))
+        .put("end", time(encounter.endedAt))
         .put("startMs", encounter.startedAt)
         .put("endMs", encounter.endedAt)
         .put("minutes", ((encounter.endedAt - encounter.startedAt) / 60_000).toInt())
+        .put("hasPos", encounter.hasStart)
         .put("lat", round6(encounter.startLat))
         .put("lon", round6(encounter.startLon))
-        .put("lens", encounter.lens ?: "")
+        .put("elat", round6(encounter.endLat))
+        .put("elon", round6(encounter.endLon))
+        // The lens the photo was taken with when there is a photo; the encounter's first lens
+        // otherwise. A replaced photo used to keep the caption of the frame it replaced.
+        .put("lens", (if (photo != null) encounter.photoLens else null) ?: encounter.lens ?: "")
         .put("sightings", encounter.sightings)
         .put("score", encounter.bestScore.toInt())
         .put("photo", photo ?: "")
+        .put("photoSkipped", skipped)
 
     private fun reasons(plate: String, level: ThreatLevel): List<String> {
         val vehicle = store.vehicle(plate) ?: return emptyList()
         return buildList {
             if (vehicle.blacklisted) add("в чёрном списке")
+            if (vehicle.police) add("полиция")
             if (vehicle.sharedTurns > 0) add("${vehicle.sharedTurns} общих поворотов")
             if (vehicle.tripsSeen > 1) add("${vehicle.tripsSeen} разные поездки")
             if (vehicle.reacquisitions > 0) add("${vehicle.reacquisitions}× терялся и возвращался")
@@ -303,6 +342,9 @@ class HtmlReportBuilder(
     private fun round1(value: Double) = Math.round(value * 10.0) / 10.0
     private fun round6(value: Double) = Math.round(value * 1_000_000.0) / 1_000_000.0
 
+    private fun zoned(ms: Long) = Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault())
+    private fun time(ms: Long): String = TIME.format(zoned(ms))
+
     private fun document(payload: String): String = """
 <!doctype html>
 <html lang="ru">
@@ -332,8 +374,10 @@ h1 { font-size:17px; margin:0 0 2px; letter-spacing:.2px; }
 .bar { padding:10px 18px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;
   border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:600; }
 .chip { border:1px solid var(--line); background:var(--panel); color:var(--ink2);
-  border-radius:999px; padding:5px 12px; font-size:12px; cursor:pointer; user-select:none; }
+  border-radius:999px; padding:5px 12px; font-size:12px; cursor:pointer; user-select:none;
+  font:inherit; font-size:12px; }
 .chip[aria-pressed="true"] { color:var(--ink); }
+.chip:focus-visible { outline:2px solid var(--l1); outline-offset:2px; }
 .chip i { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px;
   vertical-align:1px; }
 #q { margin-left:auto; background:var(--panel); border:1px solid var(--line); color:var(--ink);
@@ -347,7 +391,7 @@ h2 { font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--
   margin-bottom:6px; }
 .tlname { font:600 12px/1 ui-monospace,Menlo,Consolas,monospace;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.tltrack { position:relative; height:14px; background:#0f1216; border-radius:7px; }
+.tltrack { position:relative; height:14px; background:#0f1216; border-radius:7px; overflow:hidden; }
 .seg { position:absolute; top:0; height:14px; border-radius:4px; min-width:3px;
   box-shadow:0 0 0 2px var(--panel); }
 .axis { display:flex; justify-content:space-between; color:var(--ink3); font-size:10px;
@@ -358,6 +402,7 @@ h2 { font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--
 .plate { font:700 20px/1 ui-monospace,Menlo,Consolas,monospace; letter-spacing:1px; }
 .badge { font-size:10px; font-weight:700; padding:3px 9px; border-radius:999px; color:#0b0d10;
   letter-spacing:.4px; }
+.badge.police { background:#ffffff; }
 .muted { color:var(--ink2); font-size:12px; }
 .reasons { margin-top:7px; display:flex; gap:6px; flex-wrap:wrap; }
 .reason { background:#0f1216; border:1px solid var(--line); border-radius:8px; padding:3px 9px;
@@ -393,14 +438,14 @@ h2 { font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--
 </header>
 
 <div class="bar">
-  <span class="chip" data-level="all" aria-pressed="true">все</span>
-  <span class="chip" data-level="4" aria-pressed="true"><i style="background:var(--l4)"></i>чёрный список</span>
-  <span class="chip" data-level="3" aria-pressed="true"><i style="background:var(--l3)"></i>хвост</span>
-  <span class="chip" data-level="2" aria-pressed="true"><i style="background:var(--l2)"></i>подозрение</span>
-  <span class="chip" data-level="1" aria-pressed="true"><i style="background:var(--l1)"></i>наблюдение</span>
-  <span class="chip" data-level="0" aria-pressed="true"><i style="background:var(--l0)"></i>контакт</span>
+  <button type="button" class="chip" data-level="all" aria-pressed="true">все</button>
+  <button type="button" class="chip" data-level="4" aria-pressed="true"><i style="background:var(--l4)"></i>чёрный список</button>
+  <button type="button" class="chip" data-level="3" aria-pressed="true"><i style="background:var(--l3)"></i>хвост</button>
+  <button type="button" class="chip" data-level="2" aria-pressed="true"><i style="background:var(--l2)"></i>подозрение</button>
+  <button type="button" class="chip" data-level="1" aria-pressed="true"><i style="background:var(--l1)"></i>наблюдение</button>
+  <button type="button" class="chip" data-level="0" aria-pressed="true"><i style="background:var(--l0)"></i>контакт</button>
   <span class="chip" style="cursor:default"><i style="background:var(--route)"></i>наш маршрут и повороты</span>
-  <input id="q" placeholder="номер…">
+  <input id="q" placeholder="номер…" aria-label="поиск по номеру">
 </div>
 
 <div id="map"></div>
@@ -462,15 +507,23 @@ document.getElementById('tiles').innerHTML = [
       (note ? '<div class="armsub">' + note + '</div>' : '') +
       '</div>';
   }
+  // Two separate facts: which strategy finds more plates, and which costs less. The old text
+  // welded "and faster" onto the accuracy winner whether or not it was.
+  function speed(winnerMs, loserMs) {
+    if (winnerMs < loserMs) return ' и быстрее (' + winnerMs + ' мс против ' + loserMs + ' мс)';
+    if (winnerMs > loserMs) return ', но медленнее (' + winnerMs + ' мс против ' + loserMs + ' мс)';
+    return '';
+  }
   let verdict;
   if (C.wideSent < MIN || C.narrowSent < MIN) {
     verdict = 'Данных пока мало — нужно не меньше ' + MIN + ' вырезов на каждую стратегию. ' +
       'Покатайся ещё в режиме «эксперимент».';
   } else if (C.widePercent > C.narrowPercent) {
-    verdict = 'Лучше <b>по машине</b>: ' + C.widePercent + '% против ' + C.narrowPercent + '%.';
+    verdict = 'Лучше <b>по машине</b>: ' + C.widePercent + '% против ' + C.narrowPercent + '%' +
+      speed(C.wideMs, C.narrowMs) + '.';
   } else if (C.narrowPercent > C.widePercent) {
     verdict = 'Лучше <b>по номеру</b>: ' + C.narrowPercent + '% против ' + C.widePercent + '%' +
-      ' и быстрее (' + C.narrowMs + ' мс против ' + C.wideMs + ' мс).';
+      speed(C.narrowMs, C.wideMs) + '.';
   } else {
     verdict = 'Ничья по проценту — тогда выигрывает более дешёвая: ' +
       (C.narrowMs < C.wideMs ? '<b>по номеру</b>' : '<b>по машине</b>') + '.';
@@ -517,17 +570,24 @@ DATA.vehicles.forEach(function (v) {
   const group = L.layerGroup().addTo(map);
   const path = [];
   v.encountersData.forEach(function (e, i) {
-    if (!e.lat && !e.lon) return;
+    if (!e.hasPos || (!e.lat && !e.lon)) return;
     path.push([e.lat, e.lon]);
     bounds.push([e.lat, e.lon]);
     L.circleMarker([e.lat, e.lon], {
       radius: v.level >= 3 ? 9 : 7, color: color, fillColor: color, fillOpacity: .9, weight: 2
     }).addTo(group).bindPopup(
-      '<b>' + v.plate + '</b> · ' + v.levelName + '<br>встреча ' + (i + 1) + ' · ' + e.start +
+      '<b>' + v.plate + '</b> · ' + v.levelName + (v.police ? ' · ПОЛИЦИЯ' : '') +
+      '<br>встреча ' + (i + 1) + ' · ' + e.start +
       (e.minutes ? ' (' + e.minutes + ' мин)' : '') +
       '<br><span style="color:#9aa6b2">' + (v.makeModel || '') + ' · ' + e.lens +
       ' · OCR ' + e.score + '%</span>' + (e.photo ? '<img src="' + e.photo + '">' : '')
     );
+    // Where the meeting ended, when it ended somewhere else: the stretch of road the car was
+    // with us for, not only the point where it was first seen.
+    if ((e.elat || e.elon) && (e.elat !== e.lat || e.elon !== e.lon)) {
+      L.polyline([[e.lat, e.lon], [e.elat, e.elon]], { color: color, weight: 4, opacity: .55 }).addTo(group);
+      bounds.push([e.elat, e.elon]);
+    }
   });
   if (path.length > 1) {
     L.polyline(path, { color: color, weight: 2, opacity: .75, dashArray: '6 6' }).addTo(group);
@@ -542,8 +602,8 @@ function renderTimeline(list) {
   if (!list.length) { box.innerHTML = '<div class="empty">нет машин под фильтром</div>'; return; }
   box.innerHTML = list.map(function (v) {
     const segs = v.encountersData.map(function (e) {
-      const left = Math.max(0, (e.startMs - T0) / SPAN * 100);
-      const width = Math.max(0.7, (e.endMs - e.startMs) / SPAN * 100);
+      const left = Math.min(100, Math.max(0, (e.startMs - T0) / SPAN * 100));
+      const width = Math.min(100 - left, Math.max(0.7, (e.endMs - e.startMs) / SPAN * 100));
       return '<div class="seg" style="left:' + left + '%;width:' + width + '%;background:' +
         COLORS[v.level] + '" title="' + v.plate + ' · ' + v.levelName + ' · ' + e.start +
         ' – ' + e.end + '"></div>';
@@ -559,26 +619,28 @@ function renderCards(list) {
   if (!list.length) { box.innerHTML = '<div class="empty">нет машин под фильтром</div>'; return; }
   box.innerHTML = list.map(function (v) {
     const color = COLORS[v.level];
-    const hidden = Math.max(0, v.encounters - v.encountersShown);
+    const hidden = Math.max(0, v.encountersInWindow - v.encountersShown);
+    const older = Math.max(0, v.encounters - v.encountersInWindow);
     const shots = v.encountersData.map(function (e, i) {
+      const missing = e.photoSkipped ? 'фото не вошло в отчёт' : 'фото нет';
       return '<div class="shot">' +
-        (e.photo ? '<img src="' + e.photo + '" alt="">' : '<div class="cap">фото нет</div>') +
+        (e.photo ? '<img src="' + e.photo + '" alt="">' : '<div class="cap">' + missing + '</div>') +
         '<div class="cap">' + e.start +
         (e.minutes ? ' · ' + e.minutes + ' мин' : '') + ' · ' + e.lens + '</div></div>';
     }).join('');
     // Numbering the tiles 1..N implied they were encounters 1..N of this car. They are not: the
     // window cuts off the older ones and some have no picture, so the labels contradicted the
-    // counter in the line above. The date is the honest label; the gap is stated outright.
-    const shotNote = hidden > 0
-      ? '<div class="muted" style="margin-top:4px">показаны ' + v.encountersShown + ' из ' +
-        v.encounters + ' встреч (остальные вне окна отчёта), фото ' + v.photosShown + '</div>'
-      : (v.photosShown < v.encountersShown
-        ? '<div class="muted" style="margin-top:4px">фото есть у ' + v.photosShown + ' из ' +
-          v.encountersShown + ' встреч</div>'
-        : '');
+    // counter in the line above. The date is the honest label; the gap is stated outright — and
+    // "outside the window" is said only about meetings that really are.
+    const notes = [];
+    if (hidden > 0) notes.push('показаны ' + v.encountersShown + ' из ' + v.encountersInWindow + ' встреч за период');
+    if (older > 0) notes.push('ещё ' + older + ' встреч вне окна отчёта');
+    if (v.photosShown < v.encountersShown) notes.push('фото у ' + v.photosShown + ' из ' + v.encountersShown + ' встреч');
+    const shotNote = notes.length ? '<div class="muted" style="margin-top:4px">' + notes.join(' · ') + '</div>' : '';
     return '<div class="card" style="border-left-color:' + color + '">' +
       '<div class="head"><span class="plate" style="color:' + color + '">' + v.plate + '</span>' +
       '<span class="badge" style="background:' + color + '">' + v.levelName + '</span>' +
+      (v.police ? '<span class="badge police">🚔 ПОЛИЦИЯ</span>' : '') +
       '<span class="muted">' + [v.makeModel, v.color, v.country].filter(Boolean).join(' · ') +
       '</span></div>' +
       '<div class="reasons">' + v.reasons.map(function (r) {
@@ -591,9 +653,21 @@ function renderCards(list) {
   }).join('');
 }
 
+// The same look-alike mapping the app uses when it reads a plate, so a number typed on a Russian
+// keyboard finds the car instead of silently searching for nothing.
+const CYRILLIC = { 'А':'A','В':'B','Е':'E','К':'K','М':'M','Н':'H','О':'O','Р':'P','С':'C','Т':'T','У':'Y','Х':'X' };
+function searchKey(text) {
+  return text.toUpperCase().split('').map(function (c) { return CYRILLIC[c] || c; }).join('')
+    .replace(/[^A-Z0-9]/g, '');
+}
+
 const active = new Set([0, 1, 2, 3, 4]);
+function syncAllChip() {
+  const all = document.querySelector('.chip[data-level="all"]');
+  if (all) all.setAttribute('aria-pressed', String(active.size === 5));
+}
 function apply() {
-  const q = document.getElementById('q').value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const q = searchKey(document.getElementById('q').value.trim());
   const list = DATA.vehicles.filter(function (v) {
     return active.has(v.level) && (!q || v.key.indexOf(q) >= 0);
   });
@@ -620,6 +694,7 @@ document.querySelectorAll('.chip[data-level]').forEach(function (chip) {
       const n = Number(level);
       if (active.has(n)) { active.delete(n); } else { active.add(n); }
       chip.setAttribute('aria-pressed', String(active.has(n)));
+      syncAllChip();
     }
     apply();
   });
@@ -644,8 +719,12 @@ apply();
 """.trimIndent()
 
     private companion object {
-        val TIME = SimpleDateFormat("dd.MM HH:mm:ss", Locale.US)
-        val FILE_STAMP = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US)
+        /** Immutable and thread-safe, unlike SimpleDateFormat: reports are built on three lanes. */
+        val TIME: DateTimeFormatter = DateTimeFormatter.ofPattern("dd.MM HH:mm:ss", Locale.US)
+        val FILE_STAMP: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd_HHmm", Locale.US)
         const val MAX_SINGLE_PHOTO = 900_000L
+
+        /** Faster than this between two stored points is a GPS hop, not driving. */
+        const val MAX_PLAUSIBLE_SPEED_MPS = 70.0
     }
 }

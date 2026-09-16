@@ -47,8 +47,14 @@ object ClipSplitter {
     /** Passes allowed before giving up; each one is a full remux of the file. */
     private const val MAX_PASSES = 3
 
-    /** Below this a part holds headers and nothing else. */
-    private const val MIN_USABLE_BYTES = 64L * 1024
+    /**
+     * Below this a part holds headers and nothing else.
+     *
+     * Deliberately small: a valid last piece is one group of pictures, which at the clip bitrate
+     * can be a few tens of kilobytes. A 64 KiB floor threw away every such piece — and with it the
+     * whole split, three passes in a row, so the recording stayed on the phone as "unsplittable".
+     */
+    private const val MIN_USABLE_BYTES = 4L * 1024
 
     /**
      * Splits [source] into parts of at most [maxBytes], written next to it.
@@ -159,11 +165,14 @@ object ClipSplitter {
                     val part = File(source.parentFile, partName(source, partIndex) + ".tmp")
                     runCatching { part.delete() }
                     val next = MediaMuxer(part.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                    // Owned by the cleanup paths from this moment on: addTrack and start can both
+                    // throw, and a muxer that is not yet in `muxer` would otherwise keep its file
+                    // handle and its temporary file for the rest of the process.
+                    muxer = next
+                    pending += part
                     if (rotation != 0) runCatching { next.setOrientationHint(rotation) }
                     muxerTracks = IntArray(formats.size) { next.addTrack(formats[it]) }
                     next.start()
-                    muxer = next
-                    pending += part
                     written = 0L
                     writtenAtSync = 0L
                     timeOffsetUs = -1L
@@ -202,14 +211,19 @@ object ClipSplitter {
                 return discard(pending)
             }
             // Only now do the pieces take the names the uploader and the resend queue look for.
-            val finished = pending.map { tmp ->
+            // Every piece already published is remembered so a failure on the next one rolls the
+            // whole set back — a half-published set would be picked up by the resend queue as if
+            // it were the complete recording.
+            val finished = ArrayList<File>(pending.size)
+            for (tmp in pending) {
                 val target = File(tmp.parentFile, tmp.name.removeSuffix(".tmp"))
                 runCatching { target.delete() }
                 if (!tmp.renameTo(target)) {
                     Log.w(TAG, "cannot rename ${tmp.name}")
+                    discard(finished)
                     return discard(pending)
                 }
-                target
+                finished += target
             }
             Log.i(TAG, "${source.name}: split into ${finished.size} parts")
             return finished

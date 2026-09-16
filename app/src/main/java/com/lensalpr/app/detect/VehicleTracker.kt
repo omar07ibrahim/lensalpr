@@ -53,10 +53,17 @@ class VehicleTracker(
     private val predicted = RectF()
     private var nextId = 1
     private var frameIndex = 0L
+    private var lastUpdateMs = 0L
 
     val active: List<VehicleTrack> get() = tracks
 
     fun update(detections: List<Detection>, nowMs: Long): List<VehicleTrack> {
+        // Identity is a claim about continuity in time, not only in frames. Nothing is updated
+        // while the gate is shut — a pause, a parking stop, a `/stop` — so `missed` never grows,
+        // and a different car standing where the last one stood would inherit its id and its
+        // confirmed plate. A gap this long means every track has to prove itself again.
+        if (lastUpdateMs != 0L && nowMs - lastUpdateMs > MAX_GAP_MS) reset()
+        lastUpdateMs = nowMs
         val frame = ++frameIndex
         val claimed = BooleanArray(tracks.size)
         val matched = BooleanArray(detections.size)
@@ -174,6 +181,14 @@ class VehicleTracker(
     companion object {
         /** Frames of absence after which the shape check stops applying. */
         private const val SHAPE_GATE_MAX_MISSED = 3
+
+        /**
+         * Longest silence between two updates across which a track may keep its identity.
+         *
+         * At the fixed 25 ms frame floor twelve missed frames are well under a second; two seconds
+         * of nothing is not a slow camera, it is a closed gate.
+         */
+        const val MAX_GAP_MS = 2_000L
 
         /** Widest per-frame size change still attributable to the same vehicle approaching. */
         private const val MIN_SCALE_STEP = 0.45f

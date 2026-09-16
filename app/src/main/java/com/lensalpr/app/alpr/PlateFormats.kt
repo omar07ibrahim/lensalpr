@@ -86,6 +86,13 @@ object PlateFormats {
         return latvian(cleaned, corrected = false)?.key ?: generic(cleaned)?.key
     }
 
+    /**
+     * A fragment typed into a search box, reduced to the key alphabet: case folded, separators
+     * dropped, Cyrillic look-alikes mapped to Latin. No format rule applies — "7209" is a valid
+     * thing to search for and not a valid plate.
+     */
+    fun searchKey(raw: String?): String? = clean(raw)
+
     /** True for the road numbers and place names that share a plate's shape. */
     fun isSignage(text: String): Boolean {
         if (ROAD_NUMBER.matches(text)) return true

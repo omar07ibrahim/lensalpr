@@ -76,10 +76,14 @@ class OverlayView @JvmOverloads constructor(
                 if (box.confirmed || box.pendingCount == 0) label else "$label ${box.pendingCount}×"
             } ?: "#${box.id}"
             val textWidth = labelPaint.measureText(text)
+            val labelWidth = textWidth + LABEL_PADDING * 2
+            // Kept inside the view: a car at the right edge used to carry a label that started at
+            // the edge and ran off it, so exactly the plate the operator wanted was unreadable.
+            val left = scratch.left.coerceIn(0f, (width - labelWidth).coerceAtLeast(0f))
             labelRect.set(
-                scratch.left,
+                left,
                 scratch.top - LABEL_HEIGHT,
-                scratch.left + textWidth + LABEL_PADDING * 2,
+                left + labelWidth,
                 scratch.top,
             )
             if (labelRect.top < 0f) labelRect.offset(0f, LABEL_HEIGHT)

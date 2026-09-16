@@ -31,7 +31,13 @@ data class GeoFix(
 
 enum class TurnDirection { LEFT, RIGHT, U_TURN }
 
-/** A route decision we made: the event another driver has to copy in order to follow us. */
+/**
+ * A route decision we made: the event another driver has to copy in order to follow us.
+ *
+ * [tMs] is when the heading started to swing and [endMs] when it settled again. Both matter to the
+ * follow engine: a car seen *before* the start took the turn with us only if it is seen again
+ * *after* the end, and a car first seen during the manoeuvre proves nothing either way.
+ */
 data class TurnEvent(
     val tMs: Long,
     val direction: TurnDirection,
@@ -39,6 +45,7 @@ data class TurnEvent(
     val odometerM: Double,
     val lat: Double,
     val lon: Double,
+    val endMs: Long = tMs,
 )
 
 /**
@@ -61,8 +68,12 @@ class TripTracker(
     private val turnTimes = ArrayList<Long>()
     private val odometerSamples = ArrayList<Pair<Long, Double>>()
 
-    private var lastLocation: Location? = null
+    /** The last fix the odometer accepted; the base of the next measured step. */
+    private var lastAccepted: Location? = null
     private var lastBearing: Float? = null
+
+    /** When [lastBearing] was measured; a heading from before a GPS outage is not a heading. */
+    private var lastBearingAtMs = 0L
     private var running = false
 
     /** A heading swing is in progress; samples accumulate until it settles. */
@@ -76,6 +87,9 @@ class TripTracker(
     private var manoeuvreLon = 0.0
     private var calmSamples = 0
 
+    /** Every turn of the trip, including the ones whose timestamps have been pruned. */
+    private var totalTurns = 0
+
     @Volatile
     var current: GeoFix? = null
         private set
@@ -84,7 +98,7 @@ class TripTracker(
     var odometerM: Double = 0.0
         private set
 
-    val turnCount: Int get() = turnTimes.size
+    val turnCount: Int get() = totalTurns
 
     /** Location updates were requested and accepted; false means there is no speed source at all. */
     val isRunning: Boolean get() = running
@@ -97,6 +111,18 @@ class TripTracker(
      * as the other is what makes the whole tail detector go quiet without a word.
      */
     val hasOdometer: Boolean get() = running && current != null
+
+    /**
+     * Whether distance is being measured *right now*: a fix newer than [maxAgeMs].
+     *
+     * One fix at the start of the drive and nothing since is not an odometer; the follow engine
+     * has to fall back to time and sightings again when the feed goes away, or a phone that lost
+     * GPS in a tunnel spends the rest of the drive demanding kilometres that will never come.
+     */
+    fun hasFreshFix(nowMs: Long, maxAgeMs: Long): Boolean {
+        val fix = current ?: return false
+        return running && nowMs - fix.tMs <= maxAgeMs
+    }
 
     private val callback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
@@ -114,6 +140,11 @@ class TripTracker(
             .build()
         runCatching {
             client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+                // The request is accepted asynchronously; a refusal arrives here, not as a throw.
+                .addOnFailureListener { error ->
+                    Log.w(TAG, "location updates refused", error)
+                    running = false
+                }
         }.onFailure { error ->
             Log.w(TAG, "location updates unavailable", error)
             running = false
@@ -124,6 +155,35 @@ class TripTracker(
         if (!running) return
         running = false
         runCatching { client.removeLocationUpdates(callback) }
+        // The next start is a new stretch of road: the last heading and the last accepted point
+        // belong to wherever the car went while nobody was measuring.
+        forgetHeading()
+        lastAccepted = null
+    }
+
+    /**
+     * Continues a trip that a previous process handed over.
+     *
+     * The restart keeps the trip id, so it has to keep the numbers that describe the trip too;
+     * the restored turns carry no timestamps and therefore never count as "since" anything.
+     */
+    fun restore(odometerM: Double, turns: Int) {
+        if (odometerM > this.odometerM) this.odometerM = odometerM
+        totalTurns += turns.coerceAtLeast(0)
+    }
+
+    /**
+     * Starts the trip counters over — after a wipe, when the operator asked for a clean slate and
+     * the new trip row must not inherit the old trip's kilometres and turns.
+     */
+    fun resetTrip() {
+        odometerM = 0.0
+        totalTurns = 0
+        turnTimes.clear()
+        odometerSamples.clear()
+        forgetHeading()
+        lastAccepted = null
+        current?.let { fix -> current = fix.copy(odometerM = 0.0) }
     }
 
     /** Turns taken since [tMs]; the core follow-detection input. */
@@ -141,17 +201,7 @@ class TripTracker(
         // System.currentTimeMillis(), and a GNSS fix carrying a different notion of "now" would
         // silently shift every turn window.
         val now = System.currentTimeMillis()
-        val previous = lastLocation
-        if (previous != null && location.accuracy < MAX_ACCURACY_M) {
-            val step = distanceMeters(
-                previous.latitude,
-                previous.longitude,
-                location.latitude,
-                location.longitude,
-            )
-            if (step in MIN_STEP_M..MAX_STEP_M) odometerM += step
-        }
-        lastLocation = location
+        advanceOdometer(location)
 
         odometerSamples += now to odometerM
         if (odometerSamples.size > MAX_SAMPLES) odometerSamples.subList(0, 600).clear()
@@ -169,6 +219,42 @@ class TripTracker(
         onFix(fix)
 
         detectTurn(location, now, fix)
+    }
+
+    /**
+     * Adds the distance from the last *accepted* point, never from the last *received* one.
+     *
+     * The old rule replaced the base with every fix, accepted or not. A rejected 100 m jump while
+     * parked then became the base of the next step, and the return to the true position was
+     * booked as 100 m driven; and at a crawl every 1 m step fell under the floor, so a kilometre of
+     * traffic jam measured nothing at all.
+     */
+    private fun advanceOdometer(location: Location) {
+        if (location.accuracy >= MAX_ACCURACY_M) return
+        val base = lastAccepted
+        if (base == null) {
+            lastAccepted = location
+            return
+        }
+        val step = distanceMeters(base.latitude, base.longitude, location.latitude, location.longitude)
+        val elapsedS = (location.elapsedRealtimeNanos - base.elapsedRealtimeNanos) / 1_000_000_000.0
+        val moving = location.hasSpeed() && location.speed >= MIN_MOVING_SPEED_MPS
+        when {
+            // A jump nothing on the road can explain: a multipath hop. Take the new position as
+            // the base without booking the distance.
+            step > MAX_STEP_M && (elapsedS <= 0.0 || step > elapsedS * MAX_PLAUSIBLE_SPEED_MPS) ->
+                lastAccepted = location
+
+            step >= MIN_STEP_M -> {
+                odometerM += step
+                lastAccepted = location
+            }
+
+            // Below the floor. While actually moving the small increments are left to add up to
+            // one step; while standing still the base follows the jitter so that noise around a
+            // parked car does not slowly walk the odometer forward.
+            !moving -> lastAccepted = location
+        }
     }
 
     /**
@@ -190,12 +276,20 @@ class TripTracker(
             location.accuracy <= MAX_TURN_ACCURACY_M
         if (!usable) {
             // Stopping mid-junction ends the manoeuvre as surely as straightening out does.
-            if (inManoeuvre) finishManoeuvre()
+            if (inManoeuvre) finishManoeuvre(now, settled = false)
             return
         }
         val bearing = location.bearing
+        // A heading measured before a long silence — a tunnel, a garage, a stretch of bad fixes —
+        // is not the heading we had a moment ago. Comparing against it turned the whole outage
+        // into one instantaneous swing and a turn nobody took.
+        if (lastBearing != null && now - lastBearingAtMs > BEARING_STALE_MS) {
+            if (inManoeuvre) finishManoeuvre(now, settled = false)
+            forgetHeading()
+        }
         val previous = lastBearing
         lastBearing = bearing
+        lastBearingAtMs = now
         if (previous == null) return
         val delta = signedDelta(previous, bearing)
 
@@ -205,8 +299,10 @@ class TripTracker(
             // actually driven, while the instantaneous sum at the moment of the deadline is not.
             if (abs(manoeuvreTotal) > abs(manoeuvrePeak)) manoeuvrePeak = manoeuvreTotal
             calmSamples = if (abs(delta) < CALM_DEGREES) calmSamples + 1 else 0
-            if (calmSamples >= CALM_SAMPLES || now - manoeuvreStartMs > MANOEUVRE_MAX_MS) {
-                finishManoeuvre()
+            if (calmSamples >= CALM_SAMPLES) {
+                finishManoeuvre(now, settled = true)
+            } else if (now - manoeuvreStartMs > MANOEUVRE_MAX_MS) {
+                finishManoeuvre(now, settled = false)
             }
             return
         }
@@ -238,18 +334,31 @@ class TripTracker(
         headingWindow.clear()
     }
 
-    /** Publishes the manoeuvre that has just ended, unless the heading came back where it started. */
-    private fun finishManoeuvre() {
-        val total = if (abs(manoeuvrePeak) > abs(manoeuvreTotal)) manoeuvrePeak else manoeuvreTotal
+    /**
+     * Publishes the manoeuvre that has just ended, unless the heading came back where it started.
+     *
+     * A manoeuvre that [settled] on its own is judged by its *net* change of heading: a swerve
+     * that swung sixty degrees and came straight back is not a turn, however far it peaked. One
+     * closed by the deadline or by a loss of GPS is judged by its peak, because a roundabout that
+     * is still being circled has no net heading yet. And a manoeuvre that settled has already
+     * proven the road straight again — the calm samples that ended it are kept, so a second
+     * junction a few seconds down the road is not swallowed by a second wait for calm.
+     */
+    private fun finishManoeuvre(now: Long, settled: Boolean) {
+        val total = if (settled) manoeuvreTotal else {
+            if (abs(manoeuvrePeak) > abs(manoeuvreTotal)) manoeuvrePeak else manoeuvreTotal
+        }
+        val startMs = manoeuvreStartMs
         inManoeuvre = false
         manoeuvreTotal = 0f
         manoeuvrePeak = 0f
-        calmSamples = 0
+        calmSamples = if (settled) CALM_SAMPLES else 0
         headingWindow.clear()
         // A swerve around a pothole crosses the threshold and comes straight back; it is not a turn.
         if (abs(total) < TURN_DEGREES) return
 
-        turnTimes += manoeuvreStartMs
+        totalTurns += 1
+        turnTimes += startMs
         if (turnTimes.size > MAX_TURNS) turnTimes.subList(0, 100).clear()
         val direction = when {
             abs(total) >= U_TURN_DEGREES -> TurnDirection.U_TURN
@@ -259,14 +368,25 @@ class TripTracker(
         Log.i(TAG, "turn ${direction.name} ${total.toInt()}deg")
         onTurn(
             TurnEvent(
-                tMs = manoeuvreStartMs,
+                tMs = startMs,
                 direction = direction,
                 degrees = total,
                 odometerM = odometerM,
                 lat = manoeuvreLat,
                 lon = manoeuvreLon,
+                endMs = now,
             ),
         )
+    }
+
+    private fun forgetHeading() {
+        lastBearing = null
+        lastBearingAtMs = 0L
+        headingWindow.clear()
+        calmSamples = 0
+        inManoeuvre = false
+        manoeuvreTotal = 0f
+        manoeuvrePeak = 0f
     }
 
     companion object {
@@ -276,6 +396,15 @@ class TripTracker(
         private const val MAX_ACCURACY_M = 35f
         private const val MAX_SAMPLES = 7_200
         private const val MAX_TURNS = 1_000
+
+        /** Faster than this between two fixes is not driving, it is a GPS hop. */
+        private const val MAX_PLAUSIBLE_SPEED_MPS = 70.0
+
+        /** Reported speed below which the car is taken to be standing and jitter is not distance. */
+        private const val MIN_MOVING_SPEED_MPS = 0.7f
+
+        /** A heading older than this has nothing to say about the current one. */
+        private const val BEARING_STALE_MS = 10_000L
 
         /** Below this speed GNSS bearing is noise, not a manoeuvre. */
         private const val MIN_TURN_SPEED_MPS = 3f

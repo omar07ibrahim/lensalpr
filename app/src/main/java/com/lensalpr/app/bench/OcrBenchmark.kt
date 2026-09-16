@@ -110,9 +110,15 @@ object OcrBenchmark {
             }
             var total = 0L
             var withPlate = 0
+            var measured = 0
+            var undecodable = 0
             val texts = HashMap<String, Int>()
             files.forEach { file ->
-                val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: return@forEach
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath) ?: run {
+                    undecodable += 1
+                    return@forEach
+                }
+                measured += 1
                 val stride = bitmap.rowBytes / 4
                 val buffer = ByteBuffer
                     .allocateDirect(bitmap.rowBytes * bitmap.height)
@@ -130,7 +136,11 @@ object OcrBenchmark {
             }
             val top = texts.entries.sortedByDescending { it.value }.take(14)
                 .joinToString(", ") { "${it.key}×${it.value}" }
-            val line = "${variant.name}: ${total / files.size} мс · номер в $withPlate/${files.size} · $top"
+            // Averaged over the crops the engine actually saw: a JPEG that would not decode used
+            // to count as a zero-millisecond miss and quietly flatter every variant.
+            val average = if (measured == 0) 0L else total / measured
+            val skipped = if (undecodable > 0) " · не прочитано файлов: $undecodable" else ""
+            val line = "${variant.name}: $average мс · номер в $withPlate/$measured$skipped · $top"
             report.append(line).append('\n')
             Log.i(TAG, line)
         }

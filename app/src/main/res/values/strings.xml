@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">LensALPR</string>
+    <string name="app_name" translatable="false">LensALPR</string>
 
     <!-- Setup -->
     <string name="setup_title">Scan setup</string>
@@ -34,6 +34,7 @@
     <string name="recognition_strict_lens">Recognize only on a hardware-verified lens</string>
     <string name="recognition_vmmr">Detect make / model / colour</string>
     <string name="recognition_strict_format">Latvian plate layout only (AA-1234)</string>
+    <string name="recognition_direct_physical">Direct physical camera binding (experimental)</string>
     <string name="section_follow">Follow detection &amp; Telegram</string>
     <string name="follow_enabled">Detect tailing (GPS, turns, re-appearances)</string>
     <string name="follow_voice">Voice alerts while driving</string>
@@ -88,6 +89,7 @@
     <string name="engine_runtime_limited_fatal">ALPR engine did not come back — restarting the app</string>
     <string name="detector_error">Detector error: %1$s</string>
     <string name="camera_error">Camera error: %1$s</string>
+    <string name="scan_not_running">scanning is off</string>
     <string name="action_pause">Pause</string>
     <string name="action_resume">Resume</string>
     <string name="action_clear">Clear</string>

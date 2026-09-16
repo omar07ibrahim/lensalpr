@@ -11,7 +11,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -41,7 +43,14 @@ class ScanSessionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null || intent.action == ACTION_STOP) {
-            stopSelf()
+            // "Stop" in the shade means stop *scanning*, not just drop the notification: the
+            // session lives in the activity, and it is told first. It answers by restarting this
+            // service in its idle state, or by finishing — either way the pipeline is really off.
+            val handled = intent?.action == ACTION_STOP && stopListener?.let { listener ->
+                Handler(Looper.getMainLooper()).post { listener() }
+                true
+            } == true
+            if (!handled) stopSelf()
             return START_NOT_STICKY
         }
         // The activity owns the pipeline; restarting this service alone cannot restore a scan.
@@ -145,6 +154,13 @@ class ScanSessionService : Service() {
         private const val ACTION_STOP = "com.lensalpr.app.STOP_SESSION"
         private const val EXTRA_STATUS = "status"
         private const val WAKE_TAG = "LensALPR::session"
+
+        /**
+         * Whoever owns the session right now. Set by the scanner while it is alive and cleared
+         * when it goes; invoked on the main thread when the operator taps "Stop" in the shade.
+         */
+        @Volatile
+        var stopListener: (() -> Unit)? = null
 
         fun start(context: Context, status: String? = null) {
             val intent = Intent(context, ScanSessionService::class.java)

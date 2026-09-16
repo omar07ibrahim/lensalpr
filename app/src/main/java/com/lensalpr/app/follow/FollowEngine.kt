@@ -12,7 +12,7 @@ import com.lensalpr.app.track.TurnEvent
 import java.io.File
 import java.io.FileOutputStream
 import java.util.ArrayDeque
-import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executor
 
 enum class ThreatLevel(val rank: Int) {
     /** Passed by, parked, or too little contact to mean anything. */
@@ -93,7 +93,7 @@ data class FollowConfig(
 class FollowEngine(
     private val store: TrackingStore,
     private val tracker: TripTracker,
-    private val io: ExecutorService,
+    private val io: Executor,
     private val runtime: RuntimeSettings,
     private val config: FollowConfig = FollowConfig(),
     private val onUpdate: (FollowEvidence, AlertReason) -> Unit,
@@ -101,6 +101,14 @@ class FollowEngine(
     private val onFollowerConfirmed: (FollowEvidence) -> Unit = {},
     /** The follower has been out of frame long enough; the clip about it can end. */
     private val onFollowerLost: (String) -> Unit = {},
+    /**
+     * Whether the route-agreement classifier runs at all.
+     *
+     * With it off the engine still records every confirmed plate, keeps the operator's own lists
+     * and announces cars on them — the history is not optional — but no car is ever raised to a
+     * threat level on the strength of GPS evidence that was never collected.
+     */
+    private val detectFollowing: Boolean = true,
 ) {
 
     private class PendingTurn(val event: TurnEvent) {
@@ -189,6 +197,9 @@ class FollowEngine(
         /** Held station behind us for the configured time. */
         var follower = false
 
+        /** The contact, in seconds, at which [follower] was earned; the threshold can move later. */
+        var followerAtSeconds = 0L
+
         /** Was a follower, disappeared, and came back - the alarm case. */
         var returnedAfterFollowing = false
 
@@ -232,6 +243,9 @@ class FollowEngine(
          * that nobody is ever following it.
          */
         var hasOdometer = false
+
+        /** When distance was last actually measured for this car; stale means blind again. */
+        var lastMeasuredMs = 0L
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -263,6 +277,14 @@ class FollowEngine(
         .sortedWith(compareByDescending<FollowEvidence> { it.level.rank }.thenByDescending { it.lastSeenMs })
 
     fun evidenceFor(plate: String): FollowEvidence? = states[plate]?.let(::toEvidence)
+
+    /** Whether two keys name the same car as far as this engine is concerned. */
+    fun sameVehicle(a: String, b: String): Boolean {
+        if (a == b) return true
+        val first = resolve(a) ?: return PlateSimilarity.similar(a, b)
+        val second = resolve(b) ?: return PlateSimilarity.similar(a, b)
+        return first === second
+    }
 
     /**
      * Vehicles that were behind us moments ago, longest company first.
@@ -357,6 +379,7 @@ class FollowEngine(
         recentSightings.clear()
         loadBlacklist()
         loadIgnored()
+        loadPolice()
     }
 
     fun setBlacklisted(plate: String, blacklisted: Boolean) {
@@ -365,8 +388,11 @@ class FollowEngine(
         // vehicle actually on the road kept its old level and kept alerting.
         val state = resolve(plate) ?: State(plate).also { states[plate] = it; owned += plate }
         state.blacklisted = blacklisted
-        state.level = if (blacklisted) ThreatLevel.BLACKLIST else classify(state)
-        io.execute { runCatching { store.setBlacklisted(state.plate, blacklisted, state.displayPlate) } }
+        state.level = if (blacklisted) ThreatLevel.BLACKLIST else classify(state, System.currentTimeMillis())
+        // The row this car actually lives under, not the spelling the engine happens to use.
+        val key = state.storeKey
+        val display = state.displayPlate
+        io.execute { runCatching { store.setBlacklisted(key, blacklisted, display) } }
         // Listing a car is the operator's own action, and they are looking at the bot when they do
         // it — the button's own reply is the confirmation. An alarm here would announce "снова
         // рядом" about a car that may be nowhere near us, so the marks are only cleared, letting
@@ -386,7 +412,9 @@ class FollowEngine(
     fun setPolice(plate: String, police: Boolean) {
         val state = resolve(plate) ?: State(plate).also { states[plate] = it; owned += plate }
         state.police = police
-        io.execute { runCatching { store.setPolice(state.plate, police, state.displayPlate) } }
+        val key = state.storeKey
+        val display = state.displayPlate
+        io.execute { runCatching { store.setPolice(key, police, display) } }
         // Same reasoning as [setBlacklisted]: the operator is looking at the reply, so the marking
         // itself is not an alarm — the next time the car is actually behind us is.
         state.alertedInSegment = false
@@ -412,11 +440,13 @@ class FollowEngine(
      *
      * Called on a timer as well as on the next turn: on a long straight road the previous window
      * would otherwise stay open for kilometres and the evidence would arrive far too late to mean
-     * anything.
+     * anything. The window is measured from the end of the manoeuvre and given the same slack a
+     * late-delivered read is allowed, so a crop read ten seconds after it was taken can still
+     * claim its turn.
      */
     fun sweepTurns(nowMs: Long) {
         while (pendingTurns.isNotEmpty() &&
-            nowMs - pendingTurns.first().event.tMs > POST_TURN_WINDOW_MS
+            nowMs - pendingTurns.first().event.endMs > POST_TURN_WINDOW_MS + DELIVERY_LAG_MS
         ) {
             val turn = pendingTurns.removeFirst()
             turn.before.forEach { plate ->
@@ -437,10 +467,11 @@ class FollowEngine(
             target.reacquisitions = maxOf(target.reacquisitions, state.reacquisitions)
             target.turnsDuringContact = maxOf(target.turnsDuringContact, state.turnsDuringContact)
             target.missedTurns = maxOf(target.missedTurns, state.missedTurns)
-            // Both cars' company is real and neither includes the gap between them: bank the two
-            // completed histories and start one fresh segment, instead of taking the wider span and
-            // calling an hour apart an hour together.
-            target.contactMsBanked = target.contactMs() + state.contactMs()
+            // Both cars' company is real, but only the part that does not overlap in time may be
+            // added: the same minutes recorded under two spellings are one stretch of company,
+            // not two. The overlap of the two spans is the most that can have been double-booked.
+            val overlap = overlapMs(state, target)
+            target.contactMsBanked = (target.contactMs() + state.contactMs() - overlap).coerceAtLeast(0L)
             target.contactMBanked = target.contactM() + state.contactM()
             target.bestScore = maxOf(target.bestScore, state.bestScore)
             // Evidence is never lost by a spelling correction: whichever half knew the car was
@@ -449,10 +480,12 @@ class FollowEngine(
             target.police = target.police || state.police
             target.ignored = target.ignored || state.ignored
             target.follower = target.follower || state.follower
+            target.followerAtSeconds = maxOf(target.followerAtSeconds, state.followerAtSeconds)
             // Losing this meant the clip already running about the merged car would never be
             // recognised as running, and a second one would be started on top of it.
             target.videoActive = target.videoActive || state.videoActive
             target.hasOdometer = target.hasOdometer || state.hasOdometer
+            target.lastMeasuredMs = maxOf(target.lastMeasuredMs, state.lastMeasuredMs)
             target.movedWithUs = target.movedWithUs || state.movedWithUs
             target.returnedAfterFollowing =
                 target.returnedAfterFollowing || state.returnedAfterFollowing
@@ -474,9 +507,12 @@ class FollowEngine(
             target.level = when {
                 target.ignored -> ThreatLevel.IGNORE
                 target.blacklisted -> ThreatLevel.BLACKLIST
-                else -> classify(target)
+                else -> classify(target, System.currentTimeMillis())
             }
-            if (target.blacklisted) io.execute { runCatching { store.setBlacklisted(to, true) } }
+            if (target.blacklisted) {
+                val key = target.storeKey
+                io.execute { runCatching { store.setBlacklisted(key, true) } }
+            }
             // Merging two halves of one car's history can push it over a threshold; that is a
             // genuine promotion and has to be announced, not swallowed as bookkeeping.
             val merged = if (target.level.rank > previousTargetLevel.rank) {
@@ -490,8 +526,27 @@ class FollowEngine(
         } else {
             state.plate = to
             state.displayPlate = display
+            // The database rows were moved under the new spelling by the caller; the alert that
+            // follows must look for photos and write marks there, not under the retired key.
+            state.storeKey = to
             states[to] = state
+            owned += to
+            onUpdate(toEvidence(state), AlertReason.NONE)
         }
+        relabel(from, to)
+        return true
+    }
+
+    /** The most the two spans of two spellings can have been double-booked, in milliseconds. */
+    private fun overlapMs(a: State, b: State): Long {
+        if (a.firstSeenMs == 0L || b.firstSeenMs == 0L) return 0L
+        val start = maxOf(a.firstSeenMs - a.contactMs(), b.firstSeenMs - b.contactMs())
+        val end = minOf(a.lastSeenMs, b.lastSeenMs)
+        return (end - start).coerceAtLeast(0L)
+    }
+
+    /** Every keyed structure that still names [from] now names [to]. */
+    private fun relabel(from: String, to: String) {
         pendingTurns.forEach { turn ->
             if (turn.before.remove(from)) turn.before += to
             if (turn.credited.remove(from)) turn.credited += to
@@ -500,7 +555,6 @@ class FollowEngine(
         val relabelled = recentSightings.map { if (it.first == from) to to it.second else it }
         recentSightings.clear()
         recentSightings.addAll(relabelled)
-        return true
     }
 
     fun setIgnored(plate: String, ignored: Boolean) {
@@ -512,9 +566,11 @@ class FollowEngine(
         state.level = when {
             ignored -> ThreatLevel.IGNORE
             state.blacklisted -> ThreatLevel.BLACKLIST
-            else -> classify(state)
+            else -> classify(state, System.currentTimeMillis())
         }
-        io.execute { runCatching { store.setIgnored(state.plate, ignored, state.displayPlate) } }
+        val key = state.storeKey
+        val display = state.displayPlate
+        io.execute { runCatching { store.setIgnored(key, ignored, display) } }
         onUpdate(toEvidence(state), AlertReason.NONE)
     }
 
@@ -543,7 +599,9 @@ class FollowEngine(
      * Only the banked evidence is restored, never an open stretch of company: the car is not in
      * frame at this moment, and pretending otherwise would credit it with the gap. Returns how many
      * vehicles were queued for restoration; the restore itself lands on the main thread, where the
-     * engine's state lives.
+     * engine's state lives. A car that has already been seen by the time the rows arrive keeps its
+     * live stretch and *adds* the history — the first sighting after a restart is precisely the
+     * one the history exists for.
      */
     fun hydrate(nowMs: Long, windowMs: Long = HYDRATE_WINDOW_MS): Int {
         val rows = store.vehiclesSeenSince(nowMs - windowMs)
@@ -555,40 +613,61 @@ class FollowEngine(
         main.post {
             restored.forEach { row ->
                 val state = states.getOrPut(row.plate) { State(row.plate) }
-                // A live state always wins: this runs off the io thread and a sighting may already
-                // have landed on the same car while the query was in flight.
-                if (state.sightings > 0) return@forEach
-                state.storeKey = row.plate
-                state.displayPlate = row.displayPlate
-                state.bestScore = row.bestScore
-                state.sharedTurns = row.sharedTurns
-                state.reacquisitions = row.reacquisitions
-                state.contactMsBanked = row.contactMs
-                state.contactMBanked = row.contactM
-                state.encounters = row.encounters
-                state.tripsSeen = row.tripsSeen
-                state.makeModel = row.makeModel
-                state.color = row.color
-                state.blacklisted = row.blacklisted
-                state.police = row.police
-                state.ignored = row.ignored
+                val live = state.sightings > 0
+                if (!live) {
+                    state.storeKey = row.plate
+                    state.displayPlate = row.displayPlate
+                    state.makeModel = row.makeModel
+                    state.color = row.color
+                }
+                state.bestScore = maxOf(state.bestScore, row.bestScore)
+                state.sharedTurns = maxOf(state.sharedTurns, row.sharedTurns)
+                state.reacquisitions = maxOf(state.reacquisitions, row.reacquisitions)
+                // Banked, on top of whatever the live stretch has measured since the restart.
+                state.contactMsBanked += row.contactMs
+                state.contactMBanked += row.contactM
+                state.encounters = maxOf(state.encounters, row.encounters)
+                state.tripsSeen = maxOf(state.tripsSeen, row.tripsSeen)
+                state.makeModel = state.makeModel ?: row.makeModel
+                state.color = state.color ?: row.color
+                state.blacklisted = state.blacklisted || row.blacklisted
+                state.police = state.police || row.police
+                state.ignored = state.ignored || row.ignored
                 // It was moving with us when the evidence was collected, or it would not have a
                 // level; without this the first gate in classify() would demote it to IGNORE.
-                state.movedWithUs = row.contactM >= MOVING_CONTACT_M
+                if (row.contactM >= MOVING_CONTACT_M) state.movedWithUs = true
                 // Banked distance can only have been measured, so the restored evidence is not
                 // "blind". Without this the classifier would fall back to its no-GPS rules on the
                 // first sighting after a restart — before the new fix has arrived — and throw away
                 // the very history this method exists to preserve.
-                state.hasOdometer = row.contactM > 0.0
-                state.level = when {
+                if (row.contactM > 0.0) {
+                    state.hasOdometer = true
+                    state.lastMeasuredMs = maxOf(state.lastMeasuredMs, nowMs)
+                }
+                // The sticky facts the classifier's later transitions depend on, derived from the
+                // numbers that were kept: a car that banked more contact than the tail threshold
+                // had qualified as a follower, and a car credited with turns was in a stretch of
+                // road with turns in it.
+                if (row.contactMs >= runtime.tailSeconds * 1_000L) {
+                    state.follower = true
+                    if (state.followerAtSeconds == 0L) state.followerAtSeconds = runtime.tailSeconds.toLong()
+                }
+                if (row.sharedTurns > 0) state.turnsDuringContact = maxOf(state.turnsDuringContact, row.sharedTurns)
+                val stored = when {
                     row.ignored -> ThreatLevel.IGNORE
                     row.blacklisted -> ThreatLevel.BLACKLIST
-                    else -> ThreatLevel.of(row.level)
+                    // A level of 4 on a row no longer blacklisted is the mark the old blacklist
+                    // left behind; the engine's own verdicts never go above TAIL.
+                    else -> ThreatLevel.of(minOf(row.level, ThreatLevel.TAIL.rank))
                 }
-                // Known to be dangerous and not reported in this process yet: the next time it is
-                // actually behind us is an event, not a repeat.
-                state.lastAlertedMs = 0L
-                state.alertedInSegment = false
+                state.level = if (state.ignored) ThreatLevel.IGNORE else maxOf(state.level, stored)
+                if (!live) {
+                    // Known to be dangerous and not reported in this process yet: the next time it
+                    // is actually behind us is an event, not a repeat.
+                    state.lastAlertedMs = 0L
+                    state.alertedInSegment = false
+                }
+                owned += row.plate
             }
         }
         return restored.size
@@ -611,11 +690,14 @@ class FollowEngine(
     /**
      * A route decision we just made. Everything seen shortly before it becomes a candidate: if the
      * same plate shows up again shortly after, it took the same turn we did.
+     *
+     * "Before" ends where the manoeuvre starts. A car first read halfway round the junction was
+     * not behind us before it and proves nothing by being behind us after it.
      */
     fun onTurn(event: TurnEvent) {
         val pending = PendingTurn(event)
         val since = event.tMs - PRE_TURN_WINDOW_MS
-        recentSightings.forEach { (plate, tMs) -> if (tMs >= since) pending.before += plate }
+        recentSightings.forEach { (plate, tMs) -> if (tMs in since..event.tMs) pending.before += plate }
         pendingTurns.addLast(pending)
         sweepTurns(event.tMs)
         states.values.forEach { state ->
@@ -657,7 +739,10 @@ class FollowEngine(
         val state = states.getOrPut(key) { State(key) }
         owned += key
         state.bestScore = maxOf(state.bestScore, ocrScore)
-        if (nowMs - state.lastRecordedMs < config.minSightingIntervalMs) return
+        // A negative gap means the clock went backwards; that is not "too soon", and dropping
+        // every read until the clock catches up would blind the engine for the whole correction.
+        val sinceLast = nowMs - state.lastRecordedMs
+        if (sinceLast in 0 until config.minSightingIntervalMs) return
         state.lastRecordedMs = nowMs
         state.lastDeliveredMs = nowMs
 
@@ -670,7 +755,10 @@ class FollowEngine(
         val stampLat = lat ?: fix?.lat
         val stampLon = lon ?: fix?.lon
         val odometer = if (odometerM.isNaN()) tracker.odometerM else odometerM
-        if (tracker.hasOdometer) state.hasOdometer = true
+        if (tracker.hasFreshFix(nowMs, FIX_FRESH_MS)) {
+            state.hasOdometer = true
+            state.lastMeasuredMs = nowMs
+        }
         val previousLevel = state.level
 
         if (state.firstSeenMs == 0L) {
@@ -718,6 +806,7 @@ class FollowEngine(
         color?.let { state.color = it }
         if (odometer - state.firstOdometerM > MOVING_CONTACT_M) state.movedWithUs = true
 
+        noteBeforeTurns(key, eventMs)
         creditTurns(key, eventMs)
 
         // Time actually spent in our company, not the span between the first glimpse and the last.
@@ -726,7 +815,10 @@ class FollowEngine(
         val becameFollower = !state.follower &&
             contactMs >= runtime.tailSeconds * 1_000L &&
             state.segmentSightings >= MIN_FOLLOWER_SIGHTINGS
-        if (becameFollower) state.follower = true
+        if (becameFollower) {
+            state.follower = true
+            state.followerAtSeconds = runtime.tailSeconds.toLong()
+        }
 
         recentSightings.addLast(key to eventMs)
         while (recentSightings.isNotEmpty() &&
@@ -742,7 +834,7 @@ class FollowEngine(
             // that still stands, and a verdict that could drop and climb again would announce the
             // same car as a fresh promotion every time it did — which is how a repeat alarm turns
             // into a chant. Only the operator's own decisions, handled above, may lower a level.
-            else -> maxOf(classify(state), state.level)
+            else -> maxOf(classify(state, nowMs), state.level)
         }
         val reason = AlertPolicy.decide(
             level = state.level,
@@ -760,27 +852,29 @@ class FollowEngine(
             state.alertedInSegment = true
         }
         val evidence = toEvidence(state)
-        onUpdate(evidence, reason)
         // Film the tail, not the suspicion. A car that merely kept station behind us for a while is
         // a candidate; only a confirmed tail is worth twenty megabytes of video and the battery.
-        // Film the tail, not the suspicion. Deliberately *not* the police list: a patrol car is
-        // marked to be announced, not to be evidence, and filming it would cost more than storage.
-        // A running clip blocks the parked auto-sleep, so a marked car standing beside us keeps the
-        // scanner awake indefinitely — and the recorder takes one subject at a time, so a patrol
-        // car in view would silently deny the clip to a vehicle actually following us.
+        // Deliberately *not* the police list: a patrol car is marked to be announced, not to be
+        // evidence, and filming it would cost more than storage. A running clip blocks the parked
+        // auto-sleep, so a marked car standing beside us keeps the scanner awake indefinitely —
+        // and the recorder takes one subject at a time, so a patrol car in view would silently
+        // deny the clip to a vehicle actually following us.
         val worthFilming = !state.ignored &&
             (state.level.rank >= ThreatLevel.TAIL.rank || state.blacklisted)
-        if (worthFilming && !state.videoActive) {
-            state.videoActive = true
-            onFollowerConfirmed(evidence)
-        }
 
+        // Everything the io task needs is read here, on the thread that owns the state. The task
+        // used to read the live object while the next sighting was already changing it.
         val trip = tripId
+        val sharedTurns = state.sharedTurns
+        val reacquisitions = state.reacquisitions
+        val contactM = state.contactM()
+        val levelRank = state.level.rank
+        val displayForStore = state.displayPlate
         io.execute {
             runCatching {
                 val record = store.recordSighting(
                     plate = key,
-                    displayPlate = state.displayPlate,
+                    displayPlate = displayForStore,
                     tripId = trip,
                     tMs = capturedAtMs,
                     lat = stampLat,
@@ -799,34 +893,167 @@ class FollowEngine(
                     country = country,
                     photoWriter = thumbnail?.let { bitmap -> { file -> writeJpeg(bitmap, file) } },
                 )
-                main.post {
-                    state.encounters = record.encounters
-                    state.tripsSeen = record.tripsSeen
-                    state.places = record.places
-                    // Where the store decided this sighting belongs. Only ever read back out; the
-                    // engine's own key is left alone, because merging the two would mean rewriting
-                    // in-memory evidence for a purely clerical disagreement.
-                    state.storeKey = record.plate
-                }
+                main.post { onRecorded(state, record.plate, record.encounters, record.tripsSeen, record.places, record.newEncounter) }
                 store.updateEvidence(
                     plate = record.plate,
-                    sharedTurns = state.sharedTurns,
-                    reacquisitions = state.reacquisitions,
-                    contactMs = state.contactMs(),
-                    contactM = state.contactM(),
-                    level = state.level.rank,
+                    sharedTurns = sharedTurns,
+                    reacquisitions = reacquisitions,
+                    contactMs = contactMs,
+                    contactM = contactM,
+                    level = levelRank,
                 )
             }.onFailure { error -> Log.w(TAG, "persist failed for $key", error) }
+        }
+        // After the persistence task is queued, not before: whoever reacts to this — the alarm
+        // that fetches the encounter photo — queues its own work behind it on the same lane, and
+        // the first alarm about a freshly listed car used to look for a photo that was not
+        // written yet.
+        onUpdate(evidence, reason)
+        if (worthFilming && !state.videoActive) {
+            state.videoActive = true
+            onFollowerConfirmed(evidence)
+        }
+    }
+
+    /**
+     * The database has filed the sighting; the counters it keeps — encounters, trips, places —
+     * are inputs to the classifier, and they arrive only now.
+     *
+     * A second trip or a second place discovered here used to change nothing until the *next*
+     * sighting, and there is not always a next one. So the verdict is recomputed, a promotion is
+     * announced like any other, and the operator's "tell me after N meetings" rule is applied to
+     * the meeting that has just been counted.
+     */
+    private fun onRecorded(
+        state: State,
+        storeKey: String,
+        encounters: Int,
+        tripsSeen: Int,
+        places: Int,
+        newEncounter: Boolean,
+    ) {
+        val changed = state.encounters != encounters || state.tripsSeen != tripsSeen || state.places != places
+        state.encounters = encounters
+        state.tripsSeen = tripsSeen
+        state.places = places
+        // Where the store decided this sighting belongs. Only ever read back out; the engine's own
+        // key is left alone, because merging the two would mean rewriting in-memory evidence for a
+        // purely clerical disagreement.
+        state.storeKey = storeKey
+        if (!changed) return
+        val nowMs = System.currentTimeMillis()
+        val previousLevel = state.level
+        state.level = when {
+            state.ignored -> ThreatLevel.IGNORE
+            state.blacklisted -> ThreatLevel.BLACKLIST
+            else -> maxOf(classify(state, nowMs), state.level)
+        }
+        var reason = AlertPolicy.decide(
+            level = state.level,
+            previousLevel = previousLevel,
+            blacklisted = state.blacklisted,
+            police = state.police,
+            ignored = state.ignored,
+            segmentSightings = state.segmentSightings,
+            alertedInSegment = state.alertedInSegment,
+            lastAlertedMs = state.lastAlertedMs,
+            nowMs = nowMs,
+        )
+        // "Tell me after N separate meetings": a rule the operator sets and that no level change
+        // expresses. It fires once per new meeting, never for a car the operator dismissed, and
+        // never on top of a word that was just said.
+        if (reason == AlertReason.NONE && newEncounter && !state.ignored &&
+            encounters >= runtime.alertAfterEncounters && !state.alertedInSegment &&
+            nowMs - state.lastAlertedMs >= AlertPolicy.REPEAT_COOLDOWN_MS
+        ) {
+            reason = AlertReason.RETURNED
+        }
+        if (reason != AlertReason.NONE) {
+            state.lastAlertedMs = nowMs
+            state.alertedInSegment = true
+        }
+        if (state.level != previousLevel) {
+            val trip = tripId
+            val key = state.storeKey
+            val sharedTurns = state.sharedTurns
+            val reacquisitions = state.reacquisitions
+            val contactMs = state.contactMs()
+            val contactM = state.contactM()
+            val levelRank = state.level.rank
+            io.execute {
+                runCatching { store.updateEvidence(key, sharedTurns, reacquisitions, contactMs, contactM, levelRank) }
+            }
+            if (trip == 0L) Log.w(TAG, "level changed for $key outside a trip")
+        }
+        onUpdate(toEvidence(state), reason)
+    }
+
+    /**
+     * Files a read that is too old to say anything about the present — a crop recovered from
+     * disk minutes after it was taken — without touching the live evidence.
+     *
+     * The plate was really seen, at that time and in that place, and the record must say so;
+     * only the follow verdict, which reasons about *now*, has to leave it alone.
+     */
+    fun recordLateSighting(
+        plate: String,
+        displayPlate: String,
+        make: String?,
+        model: String?,
+        year: String?,
+        color: String?,
+        body: String?,
+        country: String?,
+        ocrScore: Float,
+        lens: String,
+        capturedAtMs: Long,
+        lat: Double?,
+        lon: Double?,
+        odometerM: Double,
+        thumbnail: Bitmap?,
+    ) {
+        val trip = tripId
+        val odometer = if (odometerM.isNaN()) Double.NaN else odometerM
+        io.execute {
+            runCatching {
+                store.recordSighting(
+                    plate = plate,
+                    displayPlate = displayPlate,
+                    tripId = trip,
+                    tMs = capturedAtMs,
+                    lat = lat,
+                    lon = lon,
+                    bearing = 0f,
+                    speedMps = 0f,
+                    odometerM = if (odometer.isNaN()) 0.0 else odometer,
+                    lens = lens,
+                    ocrScore = ocrScore,
+                    distanceM = null,
+                    make = make,
+                    model = model,
+                    year = year,
+                    color = color,
+                    body = body,
+                    country = country,
+                    photoWriter = thumbnail?.let { bitmap -> { file -> writeJpeg(bitmap, file) } },
+                )
+            }.onFailure { error -> Log.w(TAG, "late persist failed for $plate", error) }
         }
     }
 
     /**
      * Maps a reading onto the vehicle it belongs to. When the fresh spelling is the better-scored
      * one the whole history moves onto it, so the card, the database and the alerts all agree.
+     *
+     * A state the operator typed by hand and the camera has never confirmed is not a candidate:
+     * its key is exact, and folding it into a similar OCR reading would put the operator's mark
+     * — blacklist, police, dismissed — on somebody else's car.
      */
     private fun canonicalKey(plate: String, score: Float): String {
         if (states.containsKey(plate)) return plate
-        val similar = states.keys.firstOrNull { PlateSimilarity.similar(it, plate) } ?: return plate
+        val similar = states.entries.firstOrNull { (key, state) ->
+            state.sightings > 0 && PlateSimilarity.similar(key, plate)
+        }?.key ?: return plate
         val existing = states[similar] ?: return plate
         if (PlateSimilarity.prefer(similar, existing.bestScore, plate, score)) {
             Log.i(TAG, "merged $plate into $similar")
@@ -836,20 +1063,32 @@ class FollowEngine(
         existing.plate = plate
         existing.displayPlate = plate
         states[plate] = existing
-        // Turn credit is keyed by plate as well; without this the renamed car loses its evidence.
-        pendingTurns.forEach { turn ->
-            if (turn.before.remove(similar)) turn.before += plate
-            if (turn.credited.remove(similar)) turn.credited += plate
-        }
+        owned += plate
+        // Turn credit and the sighting log are keyed by plate as well; without this the renamed
+        // car loses its evidence, and the next turn cannot see it was there before.
+        relabel(similar, plate)
         Log.i(TAG, "renamed $similar to better read $plate")
         return plate
     }
 
-    private fun creditTurns(plate: String, nowMs: Long) {
+    /**
+     * A read that arrived late can still have been taken before a turn that has since been
+     * registered; it joins that turn's "before" set as if it had been on time.
+     */
+    private fun noteBeforeTurns(plate: String, eventMs: Long) {
+        pendingTurns.forEach { turn ->
+            if (eventMs in (turn.event.tMs - PRE_TURN_WINDOW_MS)..turn.event.tMs) turn.before += plate
+        }
+    }
+
+    private fun creditTurns(plate: String, eventMs: Long) {
         val state = states[plate] ?: return
         pendingTurns.forEach { turn ->
-            val age = nowMs - turn.event.tMs
-            if (age in 0..POST_TURN_WINDOW_MS &&
+            // Seen after the manoeuvre *ended* — a read taken while we were still turning says
+            // nothing about whether the car turned too — and inside the window after it.
+            val afterEnd = eventMs >= turn.event.endMs
+            val inWindow = eventMs - turn.event.tMs <= POST_TURN_WINDOW_MS
+            if (afterEnd && inWindow &&
                 plate in turn.before &&
                 turn.credited.add(plate)
             ) {
@@ -862,8 +1101,10 @@ class FollowEngine(
      * Threshold model rather than a weighted score: the operator has to be able to read the reason
      * off the card and agree with it.
      */
-    private fun classify(state: State): ThreatLevel {
+    private fun classify(state: State, nowMs: Long): ThreatLevel {
         if (state.ignored) return ThreatLevel.IGNORE
+        // No GPS evidence was ever asked for: nothing below is a verdict this engine may reach.
+        if (!detectFollowing) return ThreatLevel.IGNORE
         val contactMs = state.contactMs()
         val contactM = state.contactM()
 
@@ -872,8 +1113,9 @@ class FollowEngine(
         // same thing here, so a phone that never got a fix classified every single vehicle as
         // harmless and the scanner ran all day in perfect silence. When distance is unavailable
         // the engine falls back to what it can still measure: time in company and how many times
-        // it actually saw the car.
-        val blind = !state.hasOdometer
+        // it actually saw the car. "Unavailable" includes a feed that died after the first fix —
+        // a phone that lost GPS in a tunnel is blind again, however well it saw an hour ago.
+        val blind = !state.hasOdometer || nowMs - state.lastMeasuredMs > ODOMETER_STALE_MS
         if (blind) {
             // Cumulative counters only. The sighted branch gates on movedWithUs, which is sticky,
             // so gating on per-stretch numbers here would make the blind branch the one place in
@@ -925,8 +1167,10 @@ class FollowEngine(
         val contactM = state.contactM()
         val reasons = buildList {
             if (state.blacklisted) add("в чёрном списке")
+            if (state.police) add("полиция")
             if (state.returnedAfterFollowing) add("следовал и вернулся после пропажи")
-            if (state.follower) add("держался ${runtime.tailSeconds} с и дольше")
+            // The threshold that was actually met, not whatever the setting says today.
+            if (state.follower) add("держался ${state.followerAtSeconds.coerceAtLeast(1L)} с и дольше")
             if (state.sharedTurns > 0) add("${state.sharedTurns} общих поворот${plural(state.sharedTurns)}")
             if (state.tripsSeen > 1) add("${state.tripsSeen} разные поездки")
             if (state.places > 1) add("${state.places} разных мест")
@@ -969,26 +1213,42 @@ class FollowEngine(
         else -> "ов"
     }
 
+    /**
+     * Encodes into a temporary file and moves it into place only when the encoder said it
+     * succeeded. Writing straight into the target truncated the previous photo of the encounter
+     * first, so a failed replacement destroyed the evidence it was meant to improve.
+     */
     private fun writeJpeg(bitmap: Bitmap, file: File): Boolean = runCatching {
         if (bitmap.isRecycled) return false
-        FileOutputStream(file).use { output ->
+        val pending = File(file.parentFile, file.name + ".tmp")
+        val encoded = FileOutputStream(pending).use { output ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)
         }
-        true
+        if (!encoded || pending.length() == 0L) {
+            pending.delete()
+            return false
+        }
+        if (pending.renameTo(file)) return true
+        pending.delete()
+        false
     }.getOrDefault(false)
 
     private companion object {
         const val TAG = "LensALPR.Follow"
 
-        /** Seen this long before a turn makes a vehicle a candidate for having taken it. */
         /**
          * Sightings needed inside one stretch before it counts as following rather than as two
          * coincidental glimpses at either end of it.
          */
         const val MIN_FOLLOWER_SIGHTINGS = 4
 
-        /** How far back the engine looks when restoring its memory from the database. */
-        const val HYDRATE_WINDOW_MS = 6L * 3_600_000L
+        /**
+         * How far back the engine looks when restoring its memory from the database.
+         *
+         * Three days: a car that followed us on Friday must not be a stranger on Monday morning.
+         * Only cars with a level or an operator's mark are restored, so the cost is a few rows.
+         */
+        const val HYDRATE_WINDOW_MS = 72L * 3_600_000L
 
         /** Seen this recently counts as "still with us"; a lens rotation alone takes a few seconds. */
         const val COMPANION_WINDOW_MS = 20_000L
@@ -998,6 +1258,15 @@ class FollowEngine(
         /** Seen again within this window after the turn credits it. */
         const val POST_TURN_WINDOW_MS = 120_000L
         const val SIGHTING_LOG_MS = 180_000L
+
+        /** How late a read may arrive and still claim the turn its crop was taken after. */
+        const val DELIVERY_LAG_MS = 10_000L
+
+        /** A position fix older than this is not a measurement of where we are now. */
+        const val FIX_FRESH_MS = 30_000L
+
+        /** Without a measured distance for this long, the car is judged by time again. */
+        const val ODOMETER_STALE_MS = 120_000L
 
         /**
          * Out of sight this long ends the current stretch of company.

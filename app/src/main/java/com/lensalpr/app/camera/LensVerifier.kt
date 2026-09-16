@@ -224,7 +224,11 @@ class LensVerifier(
         // all: no amount of cropping turns a 5.4 mm wide lens into an 18.6 mm periscope.
         val source = physicalResult ?: result
         val focal = source.get(CaptureResult.LENS_FOCAL_LENGTH)
-        val observedId = activeId ?: physicalResult?.let { expectedId }
+        // Same priority as the metadata source above. When the proof comes from a physical output
+        // stream, the id shown must be that stream's, not the logical camera's notion of which
+        // module is "active" — the two legitimately differ on the direct route, and reporting the
+        // wide module's id under a verified telephoto step contradicts the very proof it labels.
+        val observedId = if (physicalResult != null) expectedId else activeId
 
         if (focal == null || !focal.isFinite()) {
             return mismatch(Reason.FOCAL_MISSING, observedId, focal)

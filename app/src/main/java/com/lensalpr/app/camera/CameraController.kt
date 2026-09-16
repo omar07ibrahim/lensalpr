@@ -41,8 +41,12 @@ data class LensState(
  *    5x -> 10x rotation never tears down the stream;
  *  * a single [LensVerifier] instance is installed as the Camera2 session capture callback and is
  *    re-targeted on every step, so the proof survives the rotation;
- *  * recognition is gated by [FrameGate], never by optimism.
+ *  * recognition is gated by [FrameGate], never by optimism;
+ *  * every asynchronous answer — the provider future, the zoom future, the verifier — is checked
+ *    against the controller's own [closed] flag and the generation it was asked for, so a callback
+ *    that lands after `/stop` or after the next lens change cannot touch the shared gate.
  */
+@androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
 class CameraController(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner,
@@ -57,6 +61,12 @@ class CameraController(
     private val onError: (String) -> Unit,
     /** Optional clip recorder bound into the same session. */
     private val videoRecorder: VideoRecorder? = null,
+    /**
+     * First generation number this controller hands to the gate. A controller built for `/go`
+     * after `/stop` must continue the numbering of the one it replaces, or the frame processor
+     * sees the same generation twice and keeps the previous session's tracks alive.
+     */
+    initialGeneration: Long = 0L,
 ) {
 
     private val mainExecutor: Executor = ContextCompat.getMainExecutor(context)
@@ -71,13 +81,23 @@ class CameraController(
     private var boundRoute: LensRoute? = null
     private var boundPhysicalId: String? = null
 
+    /** Set by [shutdown]; every late callback checks it before touching shared state. */
+    @Volatile
+    private var closed = false
+
     /** Resolution the camera actually negotiated for analysis. */
     val analysisResolution: android.util.Size?
         get() = analysis?.resolutionInfo?.resolution
 
-    private var generation = 0L
+    private var generation = initialGeneration
     private var settledGeneration = -1L
     private var appliedZoom = 1f
+
+    /** The last generation this controller handed to the gate; the next one continues from it. */
+    val currentGeneration: Long get() = generation
+
+    /** What the operator asked of the torch; re-applied after every (re)bind. */
+    private var torchWanted = false
 
     var currentStep: ZoomStep? = null
         private set
@@ -97,6 +117,9 @@ class CameraController(
         val future = ProcessCameraProvider.getInstance(context)
         future.addListener(
             {
+                // A session stopped from Telegram while the provider was still resolving must not
+                // bind a camera nobody asked for any more.
+                if (closed) return@addListener
                 val provider = runCatching { future.get() }.getOrElse { error ->
                     Log.e(TAG, "Camera provider unavailable", error)
                     onError(error.message ?: error.javaClass.simpleName)
@@ -111,6 +134,7 @@ class CameraController(
 
     /** Moves the session to [step]; rebinds only when the routing really changes. */
     fun apply(step: ZoomStep, forceRebind: Boolean = false) {
+        if (closed) return
         val provider = cameraProvider ?: return
         val route = PhysicalLensRoutingPolicy.route(
             hardware = hardware,
@@ -126,18 +150,21 @@ class CameraController(
         currentStep = step
         generation += 1
         val generation = this.generation
-        gate.beginTransition(generation)
+        gate.beginTransition(generation, step.label)
         // The same number applyZoom is about to request, so the verifier checks the camera's answer
         // against what was actually asked for rather than against the logical step.
         verifier.retarget(step, generation, PhysicalLensRoutingPolicy.controlZoomRatio(route, step))
         publishState(step)
 
-        if (needsRebind) {
-            bind(provider, step, route)
+        if (needsRebind && !bind(provider, step, route)) {
+            // Nothing is bound: there is no camera to zoom and no metadata to wait for. Settle the
+            // step so the rotation keeps moving; the stall watchdog will ask for another rebind.
+            settle(generation, force = true)
+            return
         }
-        applyZoom(step, route)
+        applyZoom(step, route, generation)
 
-        mainHandler.postDelayed({ verifier.checkTimeout() }, verifier.timeoutMs + 150L)
+        mainHandler.postDelayed({ if (!closed) verifier.checkTimeout() }, verifier.timeoutMs + 150L)
         // A HAL that answers with steady metadata still needs a moment to settle the crop; a hard
         // ceiling keeps the rotation moving even when no terminal verification state arrives.
         mainHandler.postDelayed({ settle(generation, force = true) }, SETTLE_CEILING_MS)
@@ -155,7 +182,20 @@ class CameraController(
         return true
     }
 
-    private fun bind(provider: ProcessCameraProvider, step: ZoomStep, route: LensRoute) {
+    /**
+     * Binds the use cases for [step]. Returns false when nothing could be bound.
+     *
+     * The old session is forgotten *before* it is torn down: a failed bind used to leave the
+     * fields pointing at a camera CameraX had already unbound, so the next step saw
+     * `needsRebind == false` and sent its zoom to a dead session for the rest of the drive.
+     */
+    private fun bind(provider: ProcessCameraProvider, step: ZoomStep, route: LensRoute): Boolean {
+        runCatching { analysis?.clearAnalyzer() }
+        camera = null
+        analysis = null
+        preview = null
+        boundRoute = null
+        boundPhysicalId = null
         runCatching { provider.unbindAll() }
 
         val rotation = previewView.display?.rotation ?: Surface.ROTATION_90
@@ -247,7 +287,7 @@ class CameraController(
             val builder = UseCaseGroup.Builder()
                 .addUseCase(newPreview)
                 .addUseCase(newAnalysis)
-            if (withVideo) videoRecorder?.buildUseCase()?.let(builder::addUseCase)
+            if (withVideo) videoRecorder?.buildUseCase(rotation)?.let(builder::addUseCase)
             previewView.viewPort?.let(builder::setViewPort)
             return builder.build()
         }
@@ -256,7 +296,10 @@ class CameraController(
         // refuses the combination, recognition matters more than the clip, so retry without it.
         var bound = runCatching {
             provider.bindToLifecycle(lifecycleOwner, selector(), group(videoRecorder != null))
-        }.getOrNull()
+        }.getOrElse { error ->
+            Log.w(TAG, "bindToLifecycle failed with video", error)
+            null
+        }
         if (bound == null && videoRecorder != null) {
             Log.w(TAG, "camera refused the video use case; continuing without clips")
             videoRecorder.detach()
@@ -264,14 +307,14 @@ class CameraController(
                 provider.bindToLifecycle(lifecycleOwner, selector(), group(false))
             }.getOrElse { error ->
                 Log.e(TAG, "bindToLifecycle failed", error)
-                onError(error.message ?: error.javaClass.simpleName)
                 null
             }
         }
 
         if (bound == null) {
             newAnalysis.clearAnalyzer()
-            return
+            onError("bindToLifecycle failed")
+            return false
         }
 
         preview = newPreview
@@ -279,15 +322,19 @@ class CameraController(
         camera = bound
         boundRoute = route
         boundPhysicalId = if (route == LensRoute.DIRECT_PHYSICAL_OUTPUT) step.expectedPhysicalId else null
+        // CameraX resets every control on unbind, the torch included; the operator's choice
+        // survives the rebind only if it is asked for again.
+        if (torchWanted) runCatching { bound.cameraControl.enableTorch(true) }
 
         Log.i(
             TAG,
             "Bound logical=${setup.logicalId} route=$route physical=${step.expectedPhysicalId} " +
                 "analysis=${newAnalysis.resolutionInfo?.resolution}",
         )
+        return true
     }
 
-    private fun applyZoom(step: ZoomStep, route: LensRoute) {
+    private fun applyZoom(step: ZoomStep, route: LensRoute, generation: Long) {
         val bound = camera ?: return
         val requested = PhysicalLensRoutingPolicy.controlZoomRatio(route, step)
         val zoomState = bound.cameraInfo.zoomState.value
@@ -300,6 +347,10 @@ class CameraController(
         val future = bound.cameraControl.setZoomRatio(ratio)
         future.addListener(
             {
+                // CameraX cancels a zoom request the moment the next one is issued, and the
+                // cancellation arrives after the next step has already reopened the gate. Only the
+                // answer to the request that is still current may touch the gate.
+                if (closed || generation != this.generation || bound !== camera) return@addListener
                 val failure = runCatching { future.get() }.exceptionOrNull()
                 if (failure != null) {
                     // The lens never moved, so whatever arrives next is not the step that was asked
@@ -343,7 +394,7 @@ class CameraController(
     }
 
     private fun onVerification(snapshot: LensVerifier.Snapshot) {
-        if (snapshot.generation != generation) return
+        if (closed || snapshot.generation != generation) return
         val settled = when (snapshot.state) {
             LensVerifier.State.VERIFIED,
             LensVerifier.State.UNSUPPORTED,
@@ -359,7 +410,7 @@ class CameraController(
     }
 
     private fun settle(generation: Long, force: Boolean) {
-        if (generation != this.generation || settledGeneration == generation) return
+        if (closed || generation != this.generation || settledGeneration == generation) return
         if (force) gate.updateLens(usable = gate.lensUsable, settled = true)
         settledGeneration = generation
         currentStep?.let {
@@ -371,6 +422,7 @@ class CameraController(
     }
 
     private fun publishState(step: ZoomStep) {
+        if (closed) return
         onLensState(
             LensState(
                 step = step,
@@ -405,6 +457,8 @@ class CameraController(
             val rotation = display.rotation
             preview?.targetRotation = rotation
             analysis?.targetRotation = rotation
+            // The clip must follow too, or a phone flipped end for end films upside down.
+            videoRecorder?.videoCapture?.targetRotation = rotation
         }
     }
 
@@ -414,12 +468,14 @@ class CameraController(
     }
 
     fun setTorch(enabled: Boolean) {
+        torchWanted = enabled
         runCatching { camera?.cameraControl?.enableTorch(enabled) }
     }
 
     fun hasFlash(): Boolean = camera?.cameraInfo?.hasFlashUnit() == true
 
     fun shutdown() {
+        closed = true
         runCatching {
             context.getSystemService(DisplayManager::class.java)
                 ?.unregisterDisplayListener(displayListener)

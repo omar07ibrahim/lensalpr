@@ -47,6 +47,11 @@ class TrackRuntime {
     @Volatile
     var plateAnchor: FloatArray? = null
 
+    /**
+     * When the anchor was learned, on the elapsed-realtime clock — the same clock the analysis
+     * thread ages it against. It used to be stamped with wall-clock time, and the difference of
+     * the two clocks meant the anchor never expired at all.
+     */
     @Volatile
     var anchorAtMs: Long = 0L
 }
@@ -60,6 +65,11 @@ class RecognitionState {
 
     fun remove(trackId: Int) {
         runtimes.remove(trackId)
+    }
+
+    /** Visits every live track's bookkeeping; used when a plate is re-keyed under the tracks. */
+    fun forEach(action: (Int, TrackRuntime) -> Unit) {
+        runtimes.forEach { (id, runtime) -> action(id, runtime) }
     }
 
     fun clear() {

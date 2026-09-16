@@ -61,7 +61,6 @@ class FrameProcessor(
     private val worker: AlprWorker,
     private val pool: CropBufferPool,
     private val recognition: RecognitionState,
-    private val lensLabel: () -> String,
     /** Latitude, longitude and trip odometer at this instant; stamped onto every crop. */
     private val geoStamp: () -> DoubleArray?,
     private val onTrackLost: (Int) -> Unit,
@@ -150,7 +149,11 @@ class FrameProcessor(
         try {
             lastAnalyzedAtMs = SystemClock.elapsedRealtime()
             if (firstAnalyzedAtMs == 0L) firstAnalyzedAtMs = lastAnalyzedAtMs
-            val generation = gate.generation
+            // One read of one object: the generation and the lens label it belongs to travel
+            // together, so a frame cannot be stamped with the label of a lens it was not taken
+            // through when the switch lands halfway through this method.
+            val epoch = gate.epoch
+            val generation = epoch.generation
             if (generation != lastGeneration) {
                 // Geometry from the previous lens cannot be matched against the new field of view.
                 tracker.reset()
@@ -196,7 +199,7 @@ class FrameProcessor(
                 cropRequest = null
                 serveCropRequest(frame, tracks, consumer)
             }
-            scheduleRecognition(frame, tracks, now, generation)
+            scheduleRecognition(frame, tracks, now, epoch)
             publish(frame.width, frame.height, tracks)
         } catch (error: Throwable) {
             Log.e(TAG, "frame failed", error)
@@ -337,7 +340,7 @@ class FrameProcessor(
         frame: Bitmap,
         tracks: List<VehicleTrack>,
         now: Long,
-        generation: Long,
+        epoch: FrameGate.Epoch,
     ) {
         // The operator's setting, and nothing else. Heat used to cut this to two crops and then to
         // one; the only thing that reduces it now is a genuinely full queue, below, where cutting
@@ -418,7 +421,7 @@ class FrameProcessor(
             // candidate list on a saturated queue, cutting a crop for every car in frame.
             if (attempted >= budget) break
             attempted += 1
-            submitJob(frame, track, now, generation, queueBusy, priority)
+            submitJob(frame, track, now, epoch, queueBusy, priority)
         }
     }
 
@@ -426,7 +429,7 @@ class FrameProcessor(
         frame: Bitmap,
         track: VehicleTrack,
         now: Long,
-        generation: Long,
+        epoch: FrameGate.Epoch,
         queueBusy: Boolean,
         priority: Float,
     ): Boolean {
@@ -515,7 +518,7 @@ class FrameProcessor(
 
         val job = OcrJob(
             trackId = track.id,
-            generation = generation,
+            generation = epoch.generation,
             submittedAtMs = System.currentTimeMillis(),
             buffer = buffer,
             width = pixelWidth,
@@ -523,7 +526,7 @@ class FrameProcessor(
             strideInPixels = stridePixels,
             sourceRect = Rect(cropRect),
             thumbnail = thumbnail,
-            lensLabel = lensLabel(),
+            lensLabel = epoch.label,
             quality = quality,
             priority = priority,
             lat = geo?.get(0),
@@ -603,14 +606,6 @@ class FrameProcessor(
             Bitmap.createBitmap(frame, rect.left, rect.top, rect.width(), rect.height(), matrix, true)
         }.getOrNull() ?: return null
         return if (thumbnail === frame) null else thumbnail
-    }
-
-    private fun createThumbnail(crop: Bitmap): Bitmap {
-        val scale = min(1f, THUMBNAIL_WIDTH.toFloat() / crop.width)
-        if (scale >= 1f) return crop.copy(Bitmap.Config.ARGB_8888, false)
-        val width = max(1, (crop.width * scale).roundToInt())
-        val height = max(1, (crop.height * scale).roundToInt())
-        return Bitmap.createScaledBitmap(crop, width, height, true)
     }
 
     /**

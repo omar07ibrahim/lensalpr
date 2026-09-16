@@ -62,9 +62,21 @@ data class EncounterRow(
     val photo: String?,
     val lens: String?,
     val distanceM: Double,
+    /** Score and lens of the frame the photo was actually taken from, when there is a photo. */
+    val photoScore: Float = 0f,
+    val photoLens: String? = null,
+    /** False when the encounter never had a usable position. */
+    val hasStart: Boolean = true,
 )
 
-data class TrackPoint(val tMs: Long, val lat: Double, val lon: Double, val speedMps: Float)
+data class TrackPoint(
+    val tMs: Long,
+    val lat: Double,
+    val lon: Double,
+    val speedMps: Float,
+    /** The validated trip odometer at this point; NaN for rows written before it was stored. */
+    val odometerM: Double = Double.NaN,
+)
 
 /** A route decision we made: the event a follower has to copy. */
 data class TurnRow(
@@ -155,7 +167,9 @@ class TrackingStore(context: Context) {
                     best_score REAL NOT NULL DEFAULT 0,
                     photo TEXT,
                     lens TEXT,
-                    distance_m REAL NOT NULL DEFAULT 0
+                    distance_m REAL NOT NULL DEFAULT 0,
+                    photo_score REAL NOT NULL DEFAULT 0,
+                    photo_lens TEXT
                 )
                 """.trimIndent(),
             )
@@ -178,7 +192,8 @@ class TrackingStore(context: Context) {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     trip_id INTEGER NOT NULL,
                     t_ms INTEGER NOT NULL,
-                    lat REAL NOT NULL, lon REAL NOT NULL, speed REAL
+                    lat REAL NOT NULL, lon REAL NOT NULL, speed REAL,
+                    odometer_m REAL
                 )
                 """.trimIndent(),
             )
@@ -236,6 +251,19 @@ class TrackingStore(context: Context) {
             if (!hasColumn(db, "vehicles", "police")) {
                 db.execSQL("ALTER TABLE vehicles ADD COLUMN police INTEGER NOT NULL DEFAULT 0")
             }
+            if (!hasColumn(db, "encounters", "photo_score")) {
+                db.execSQL("ALTER TABLE encounters ADD COLUMN photo_score REAL NOT NULL DEFAULT 0")
+                // Rows from before the column existed: the photo they hold was taken at the best
+                // score of the encounter at the time, which is the closest thing on record.
+                db.execSQL("UPDATE encounters SET photo_score = best_score WHERE photo IS NOT NULL")
+            }
+            if (!hasColumn(db, "encounters", "photo_lens")) {
+                db.execSQL("ALTER TABLE encounters ADD COLUMN photo_lens TEXT")
+                db.execSQL("UPDATE encounters SET photo_lens = lens WHERE photo IS NOT NULL")
+            }
+            if (!hasColumn(db, "track", "odometer_m")) {
+                db.execSQL("ALTER TABLE track ADD COLUMN odometer_m REAL")
+            }
         }
     }
 
@@ -266,6 +294,30 @@ class TrackingStore(context: Context) {
         )
     }
 
+    /**
+     * Closes every trip a dead process left open, except the one that is running now.
+     *
+     * A crash or a kill never reaches [finishTrip], and a row with no end used to mean "still
+     * active" for ever: it was never pruned, and the report treated it as a trip in progress.
+     * The end is set to the last thing recorded on it — the last track point, else the start.
+     */
+    fun closeAbandonedTrips(exceptTripId: Long) {
+        db.execSQL(
+            """
+            UPDATE trips SET ended_at = COALESCE(
+                (SELECT MAX(t_ms) FROM track WHERE track.trip_id = trips.id),
+                (SELECT MAX(ended_at) FROM encounters WHERE encounters.trip_id = trips.id),
+                started_at
+            ), distance_m = COALESCE(
+                (SELECT MAX(odometer_m) FROM track WHERE track.trip_id = trips.id AND odometer_m IS NOT NULL),
+                distance_m
+            )
+            WHERE ended_at IS NULL AND id != ?
+            """.trimIndent(),
+            arrayOf<Any?>(exceptTripId),
+        )
+    }
+
     fun appendTrackPoint(tripId: Long, point: TrackPoint) {
         db.insert(
             "track",
@@ -276,6 +328,7 @@ class TrackingStore(context: Context) {
                 put("lat", point.lat)
                 put("lon", point.lon)
                 put("speed", point.speedMps)
+                if (point.odometerM.isFinite()) put("odometer_m", point.odometerM)
             },
         )
     }
@@ -295,32 +348,63 @@ class TrackingStore(context: Context) {
         )
     }
 
-    fun turnsSince(sinceMs: Long, limit: Int = 500): List<TurnRow> = db.rawQuery(
-        "SELECT t_ms, lat, lon, direction, degrees FROM turns WHERE t_ms >= ? ORDER BY t_ms LIMIT ?",
-        arrayOf(sinceMs.toString(), limit.toString()),
-    ).use { cursor ->
-        buildList {
-            while (cursor.moveToNext()) {
-                add(
-                    TurnRow(
-                        cursor.getLong(0),
-                        cursor.getDouble(1),
-                        cursor.getDouble(2),
-                        cursor.getString(3),
-                        cursor.getFloat(4),
-                    ),
-                )
+    fun turnsSince(sinceMs: Long, limit: Int = 5_000): List<TurnRow> =
+        turnsBetween(sinceMs, Long.MAX_VALUE, null, limit)
+
+    /**
+     * Our turns inside a window, optionally only those of the given trips.
+     *
+     * A per-vehicle report is about one car's trips; the turns of every other drive in the
+     * database have no business on its map, and they used to drag the map's frame across the
+     * whole country.
+     */
+    fun turnsBetween(sinceMs: Long, untilMs: Long, tripIds: Collection<Long>?, limit: Int = 5_000): List<TurnRow> {
+        val trips = tripIds?.takeIf { it.isNotEmpty() }
+        val tripClause = trips?.let { " AND trip_id IN (${it.joinToString(",") { id -> id.toString() }})" }.orEmpty()
+        return db.rawQuery(
+            "SELECT t_ms, lat, lon, direction, degrees FROM turns WHERE t_ms >= ? AND t_ms <= ?$tripClause " +
+                "ORDER BY t_ms LIMIT ?",
+            arrayOf(sinceMs.toString(), untilMs.toString(), limit.toString()),
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        TurnRow(
+                            cursor.getLong(0),
+                            cursor.getDouble(1),
+                            cursor.getDouble(2),
+                            cursor.getString(3),
+                            cursor.getFloat(4),
+                        ),
+                    )
+                }
             }
         }
     }
 
+    /** Ids of the trips that overlap the window, newest last; a trip still open counts as ongoing. */
+    fun tripsBetween(sinceMs: Long, untilMs: Long): List<Long> = db.rawQuery(
+        "SELECT id FROM trips WHERE started_at <= ? AND (ended_at IS NULL OR ended_at >= ?) ORDER BY started_at",
+        arrayOf(untilMs.toString(), sinceMs.toString()),
+    ).use { cursor ->
+        buildList { while (cursor.moveToNext()) add(cursor.getLong(0)) }
+    }
+
     fun trackPoints(tripId: Long): List<TrackPoint> = db.rawQuery(
-        "SELECT t_ms, lat, lon, speed FROM track WHERE trip_id = ? ORDER BY t_ms",
+        "SELECT t_ms, lat, lon, speed, odometer_m FROM track WHERE trip_id = ? ORDER BY t_ms",
         arrayOf(tripId.toString()),
     ).use { cursor ->
         buildList {
             while (cursor.moveToNext()) {
-                add(TrackPoint(cursor.getLong(0), cursor.getDouble(1), cursor.getDouble(2), cursor.getFloat(3)))
+                add(
+                    TrackPoint(
+                        cursor.getLong(0),
+                        cursor.getDouble(1),
+                        cursor.getDouble(2),
+                        cursor.getFloat(3),
+                        if (cursor.isNull(4)) Double.NaN else cursor.getDouble(4),
+                    ),
+                )
             }
         }
     }
@@ -364,16 +448,18 @@ class TrackingStore(context: Context) {
             // Yesterday's row for the same car may spell one character differently; land on it
             // instead of creating a twin, or keep the better read and rename the old row.
             val plate = canonicalPlate(plate, displayPlate, ocrScore)
+            // The running encounter is this trip's: a new drive that meets the same car within
+            // three minutes of the old one ending is a second meeting, not a continuation.
             val existing = database.rawQuery(
-                "SELECT id, ended_at, best_score, photo FROM encounters " +
-                    "WHERE plate = ? ORDER BY ended_at DESC LIMIT 1",
-                arrayOf(plate),
+                "SELECT id, ended_at, photo_score, photo FROM encounters " +
+                    "WHERE plate = ? AND trip_id = ? ORDER BY ended_at DESC LIMIT 1",
+                arrayOf(plate, tripId.toString()),
             ).use { cursor ->
                 if (cursor.moveToFirst()) {
                     OpenEncounter(
                         id = cursor.getLong(0),
                         endedAt = cursor.getLong(1),
-                        bestScore = cursor.getFloat(2),
+                        photoScore = cursor.getFloat(2),
                         photo = cursor.getString(3),
                     )
                 } else {
@@ -381,19 +467,28 @@ class TrackingStore(context: Context) {
                 }
             }
 
-            val running = existing?.takeIf { tMs - it.endedAt <= ENCOUNTER_GAP_MS }
+            val running = existing?.takeIf { kotlin.math.abs(tMs - it.endedAt) <= ENCOUNTER_GAP_MS }
             val encounterId: Long
             var newEncounter = false
             val wantsPhoto: Boolean
 
             if (running != null) {
                 encounterId = running.id
-                wantsPhoto = ocrScore > running.bestScore + PHOTO_IMPROVEMENT ||
+                // Against the score of the photo that is actually on disk, not the encounter's
+                // best read: reads that improved in small steps never replaced a weak first shot.
+                wantsPhoto = ocrScore > running.photoScore + PHOTO_IMPROVEMENT ||
                     running.photo.isNullOrBlank()
+                // Reads can arrive out of capture order. The start only moves earlier, the end
+                // only later, and the end position follows the end time rather than the delivery.
                 database.execSQL(
-                    "UPDATE encounters SET ended_at = MAX(ended_at, ?), end_lat = ?, end_lon = ?, " +
+                    "UPDATE encounters SET " +
+                        "started_at = MIN(started_at, ?), " +
+                        "start_lat = COALESCE(start_lat, ?), start_lon = COALESCE(start_lon, ?), " +
+                        "end_lat = CASE WHEN ? >= ended_at THEN COALESCE(?, end_lat) ELSE end_lat END, " +
+                        "end_lon = CASE WHEN ? >= ended_at THEN COALESCE(?, end_lon) ELSE end_lon END, " +
+                        "ended_at = MAX(ended_at, ?), " +
                         "sightings = sightings + 1, best_score = MAX(best_score, ?) WHERE id = ?",
-                    arrayOf<Any?>(tMs, lat, lon, ocrScore, encounterId),
+                    arrayOf<Any?>(tMs, lat, lon, tMs, lat, tMs, lon, tMs, ocrScore, encounterId),
                 )
             } else {
                 newEncounter = true
@@ -515,9 +610,12 @@ class TrackingStore(context: Context) {
             // is the observation that matters — but a missing picture now leaves a trace.
             if (photoWriter(file)) {
                 runCatching {
+                    // The score and the lens of the frame the picture came from travel with it,
+                    // so the next candidate is judged against the photo that is really there and
+                    // the report captions the photo with the lens that took it.
                     database.execSQL(
-                        "UPDATE encounters SET photo = ? WHERE id = ?",
-                        arrayOf<Any?>(file.absolutePath, photoFor),
+                        "UPDATE encounters SET photo = ?, photo_score = ?, photo_lens = ? WHERE id = ?",
+                        arrayOf<Any?>(file.absolutePath, ocrScore, lens, photoFor),
                     )
                 }.onFailure { error ->
                     Log.w(TAG, "encounter $photoFor: photo written but not linked", error)
@@ -652,32 +750,43 @@ class TrackingStore(context: Context) {
     /**
      * Operator override for a plate the engine got wrong, or a merge that should not have happened.
      * When the target already exists the two cars are merged; otherwise the row is simply renamed.
+     *
+     * Checked and changed inside one transaction, and judged by the rows that actually moved: the
+     * automatic merge can rename the same row a moment before, and a rename that changed nothing
+     * used to answer "done" anyway.
      */
     fun renamePlateManually(from: String, to: String, displayPlate: String): Boolean {
         if (from == to) return false
-        val source = vehicle(from) ?: return false
-        db.beginTransaction()
+        val database = db
+        database.beginTransaction()
         try {
-            if (vehicle(to) != null) {
+            if (vehicle(from) == null) return false
+            val changed = if (vehicle(to) != null) {
                 mergeInto(from = from, into = to)
+                vehicle(from) == null
             } else {
-                renamePlate(from, to, displayPlate)
+                renamePlate(from, to, displayPlate) > 0
             }
-            db.setTransactionSuccessful()
+            database.setTransactionSuccessful()
+            return changed
         } finally {
-            db.endTransaction()
+            database.endTransaction()
         }
-        return source.plate == from
     }
 
     /** Moves every row of one plate onto another. Called only when the target has no row yet. */
-    private fun renamePlate(from: String, to: String, displayPlate: String) {
-        db.execSQL(
+    private fun renamePlate(from: String, to: String, displayPlate: String): Int {
+        val moved = db.compileStatement(
             "UPDATE vehicles SET plate = ?, display_plate = ? WHERE plate = ?",
-            arrayOf<Any?>(to, displayPlate, from),
-        )
+        ).use { statement ->
+            statement.bindString(1, to)
+            statement.bindString(2, displayPlate)
+            statement.bindString(3, from)
+            statement.executeUpdateDelete()
+        }
         db.execSQL("UPDATE encounters SET plate = ? WHERE plate = ?", arrayOf<Any?>(to, from))
         db.execSQL("UPDATE sightings SET plate = ? WHERE plate = ?", arrayOf<Any?>(to, from))
+        return moved
     }
 
     /**
@@ -716,6 +825,10 @@ class TrackingStore(context: Context) {
      * nothing for a car with no row yet — while the bot answered "⛔️ в чёрном списке". The mark
      * survived in memory until the next start and then vanished, which is the worst possible
      * outcome for the one control that exists to make a car impossible to miss.
+     *
+     * Taking a car off the list also takes the level the list gave it: the blacklist writes 4
+     * into a column that otherwise only ever grows, and left there it came back as BLACKLIST on
+     * the next start.
      */
     fun setBlacklisted(
         plate: String,
@@ -725,8 +838,9 @@ class TrackingStore(context: Context) {
     ) {
         ensureVehicleRow(plate, displayPlate)
         db.execSQL(
-            "UPDATE vehicles SET blacklisted = ?, note = COALESCE(?, note) WHERE plate = ?",
-            arrayOf<Any?>(if (blacklisted) 1 else 0, note, plate),
+            "UPDATE vehicles SET blacklisted = ?, note = COALESCE(?, note), " +
+                "level = CASE WHEN ? = 0 AND level >= 4 THEN 0 ELSE level END WHERE plate = ?",
+            arrayOf<Any?>(if (blacklisted) 1 else 0, note, if (blacklisted) 1 else 0, plate),
         )
     }
 
@@ -864,19 +978,35 @@ class TrackingStore(context: Context) {
         buildList { while (cursor.moveToNext()) add(cursor.toVehicle()) }
     }
 
-    fun vehiclesSeenSince(sinceMs: Long, limit: Int = 400): List<VehicleRow> = db.rawQuery(
+    fun vehiclesSeenSince(sinceMs: Long, limit: Int = 2_000): List<VehicleRow> = db.rawQuery(
         "$VEHICLE_COLUMNS WHERE last_seen >= ? ORDER BY level DESC, last_seen DESC LIMIT ?",
         arrayOf(sinceMs.toString(), limit.toString()),
     ).use { cursor ->
         buildList { while (cursor.moveToNext()) add(cursor.toVehicle()) }
     }
 
-    /** Substring search over everything ever seen, for the bot. */
-    fun searchPlates(query: String, limit: Int = 20): List<VehicleRow> = db.rawQuery(
-        "$VEHICLE_COLUMNS WHERE plate LIKE ? ORDER BY last_seen DESC LIMIT ?",
-        arrayOf("%${query.uppercase()}%", limit.toString()),
-    ).use { cursor ->
-        buildList { while (cursor.moveToNext()) add(cursor.toVehicle()) }
+    /** How many vehicles were seen in the window — the true count, not the size of a page. */
+    fun countVehiclesSeenSince(sinceMs: Long): Int = db.rawQuery(
+        "SELECT COUNT(*) FROM vehicles WHERE last_seen >= ?",
+        arrayOf(sinceMs.toString()),
+    ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
+
+    /**
+     * Substring search over everything ever seen, for the bot.
+     *
+     * The query is reduced to the key alphabet first — no dashes, no spaces, look-alike Cyrillic
+     * mapped to Latin — because the operator pastes the plate the way the app shows it, `EM-7209`,
+     * and the keys are stored without the dash.
+     */
+    fun searchPlates(query: String, limit: Int = 20): List<VehicleRow> {
+        val needle = com.lensalpr.app.alpr.PlateFormats.searchKey(query) ?: return emptyList()
+        return db.rawQuery(
+            "$VEHICLE_COLUMNS WHERE plate LIKE ? OR REPLACE(display_plate, '-', '') LIKE ? " +
+                "ORDER BY last_seen DESC LIMIT ?",
+            arrayOf("%$needle%", "%$needle%", limit.toString()),
+        ).use { cursor ->
+            buildList { while (cursor.moveToNext()) add(cursor.toVehicle()) }
+        }
     }
 
     /**
@@ -886,11 +1016,15 @@ class TrackingStore(context: Context) {
      * would otherwise fill the limit with ancient rows and the report would show nothing at all for
      * the very vehicle it exists to describe.
      */
-    fun encounters(plate: String, sinceMs: Long = 0L, limit: Int = 50): List<EncounterRow> = db.rawQuery(
-        "SELECT id, plate, trip_id, started_at, ended_at, start_lat, start_lon, end_lat, end_lon, " +
-            "sightings, best_score, photo, lens, distance_m FROM encounters " +
-            "WHERE plate = ? AND ended_at >= ? ORDER BY started_at DESC LIMIT ?",
-        arrayOf(plate, sinceMs.toString(), limit.toString()),
+    fun encounters(
+        plate: String,
+        sinceMs: Long = 0L,
+        untilMs: Long = Long.MAX_VALUE,
+        limit: Int = 500,
+    ): List<EncounterRow> = db.rawQuery(
+        "$ENCOUNTER_COLUMNS WHERE plate = ? AND ended_at >= ? AND started_at <= ? " +
+            "ORDER BY started_at DESC LIMIT ?",
+        arrayOf(plate, sinceMs.toString(), untilMs.toString(), limit.toString()),
     ).use { cursor ->
         // Newest first in SQL so the limit keeps the recent history, reversed here because every
         // caller wants it in the order it happened. Ascending with a limit would hand a long-lived
@@ -898,10 +1032,13 @@ class TrackingStore(context: Context) {
         buildList { while (cursor.moveToNext()) add(cursor.toEncounter()) }.reversed()
     }
 
-    fun encountersSince(sinceMs: Long, limit: Int = 600): List<EncounterRow> = db.rawQuery(
-        "SELECT id, plate, trip_id, started_at, ended_at, start_lat, start_lon, end_lat, end_lon, " +
-            "sightings, best_score, photo, lens, distance_m FROM encounters WHERE ended_at >= ? " +
-            "ORDER BY started_at LIMIT ?",
+    fun countEncounters(plate: String, sinceMs: Long = 0L, untilMs: Long = Long.MAX_VALUE): Int = db.rawQuery(
+        "SELECT COUNT(*) FROM encounters WHERE plate = ? AND ended_at >= ? AND started_at <= ?",
+        arrayOf(plate, sinceMs.toString(), untilMs.toString()),
+    ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
+
+    fun encountersSince(sinceMs: Long, limit: Int = 5_000): List<EncounterRow> = db.rawQuery(
+        "$ENCOUNTER_COLUMNS WHERE ended_at >= ? ORDER BY started_at LIMIT ?",
         arrayOf(sinceMs.toString(), limit.toString()),
     ).use { cursor ->
         buildList { while (cursor.moveToNext()) add(cursor.toEncounter()) }
@@ -933,8 +1070,13 @@ class TrackingStore(context: Context) {
 
     // ------------------------------------------------------------------ misc
 
-    /** Keeps the evidence set bounded; plate data is personal data, so it does not live forever. */
-    fun prune(olderThanMs: Long) {
+    /**
+     * Keeps the evidence set bounded; plate data is personal data, so it does not live forever.
+     *
+     * [currentTripId] is the one trip that may stay open: any other trip without an end was left
+     * behind by a dead process and expires like a finished one.
+     */
+    fun prune(olderThanMs: Long, currentTripId: Long = 0L) {
         val stale = db.rawQuery(
             "SELECT photo FROM encounters WHERE ended_at < ? AND photo IS NOT NULL",
             arrayOf(olderThanMs.toString()),
@@ -948,8 +1090,8 @@ class TrackingStore(context: Context) {
         // Our own turns are a complete record of where the driver goes; they expire like the rest.
         db.execSQL("DELETE FROM turns WHERE t_ms < ?", arrayOf<Any?>(olderThanMs))
         db.execSQL(
-            "DELETE FROM trips WHERE ended_at IS NOT NULL AND ended_at < ?",
-            arrayOf<Any?>(olderThanMs),
+            "DELETE FROM trips WHERE id != ? AND COALESCE(ended_at, started_at) < ?",
+            arrayOf<Any?>(currentTripId, olderThanMs),
         )
         db.execSQL(
             // A police mark is a deliberate operator decision like the other two, so retention
@@ -960,14 +1102,30 @@ class TrackingStore(context: Context) {
         // Retention removed encounters and their photos; the per-vehicle counters were left behind
         // and kept claiming meetings whose rows and pictures no longer exist. That is one of the
         // ways "5 encounters, 3 photos" happened without anything actually going wrong.
+        // The counts are exact: a row the operator typed by hand has met us on zero trips, and
+        // pretending it was one made the report claim a meeting that never happened.
         db.execSQL(
             """
             UPDATE vehicles SET
                 encounters = (SELECT COUNT(*) FROM encounters e WHERE e.plate = vehicles.plate),
-                trips_seen = MAX(1, (SELECT COUNT(DISTINCT trip_id) FROM encounters e WHERE e.plate = vehicles.plate)),
+                trips_seen = (SELECT COUNT(DISTINCT trip_id) FROM encounters e WHERE e.plate = vehicles.plate),
                 sightings = (SELECT COUNT(*) FROM sightings s WHERE s.plate = vehicles.plate)
             """.trimIndent(),
         )
+        // Photos whose encounter is gone — written after a crash, or linked to a row that was
+        // deleted — were never reclaimed by anything. Only files the table does not mention.
+        runCatching {
+            val referenced = db.rawQuery("SELECT photo FROM encounters WHERE photo IS NOT NULL", null).use { cursor ->
+                buildSet { while (cursor.moveToNext()) add(File(cursor.getString(0)).name) }
+            }
+            photoDir.listFiles()?.forEach { file ->
+                if (file.isFile && file.name !in referenced && file.name.endsWith(".jpg") &&
+                    System.currentTimeMillis() - file.lastModified() > ORPHAN_PHOTO_GRACE_MS
+                ) {
+                    file.delete()
+                }
+            }
+        }
     }
 
     /**
@@ -1047,19 +1205,22 @@ class TrackingStore(context: Context) {
         photo = getString(11),
         lens = getString(12),
         distanceM = getDouble(13),
+        photoScore = getFloat(14),
+        photoLens = getString(15),
+        hasStart = !isNull(5) && !isNull(6),
     )
 
     private class OpenEncounter(
         val id: Long,
         val endedAt: Long,
-        val bestScore: Float,
+        val photoScore: Float,
         val photo: String?,
     )
 
     private companion object {
         const val TAG = "LensALPR.Store"
         const val NAME = "lensalpr.db"
-        const val VERSION = 4
+        const val VERSION = 5
 
         /** A gap longer than this starts a new encounter with the same vehicle. */
         const val ENCOUNTER_GAP_MS = 180_000L
@@ -1072,9 +1233,16 @@ class TrackingStore(context: Context) {
         const val PLACE_RADIUS_M = 600.0
         const val PLACE_SCAN_LIMIT = 60
 
+        /** A photo not yet linked to its row may still be mid-write; leave the fresh ones alone. */
+        const val ORPHAN_PHOTO_GRACE_MS = 3_600_000L
+
         const val VEHICLE_COLUMNS =
             "SELECT plate, display_plate, make, model, year, color, body, country, first_seen, " +
                 "last_seen, sightings, encounters, trips_seen, shared_turns, reacquisitions, " +
                 "contact_ms, contact_m, best_score, level, blacklisted, ignored, police, note FROM vehicles"
+
+        const val ENCOUNTER_COLUMNS =
+            "SELECT id, plate, trip_id, started_at, ended_at, start_lat, start_lon, end_lat, end_lon, " +
+                "sightings, best_score, photo, lens, distance_m, photo_score, photo_lens FROM encounters"
     }
 }

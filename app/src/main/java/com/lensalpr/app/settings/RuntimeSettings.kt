@@ -70,18 +70,24 @@ class RuntimeSettings(context: Context) {
         return enginePreventiveReload
     }
 
+    /** What a restarting process hands to the next one about the trip in progress. */
+    data class TripHandover(val tripId: Long, val startedAtMs: Long, val odometerM: Double, val turns: Int)
+
     /**
      * Remembers the running trip across a deliberate process restart.
      *
      * Restarting the process to revive the engine must not fabricate evidence: a new trip id would
      * make every car still behind us look like it had met us "on two different trips", which is one
-     * of the things that promotes a vehicle to SUSPECT.
+     * of the things that promotes a vehicle to SUSPECT. The distance and the turns go with it, or
+     * the debrief of the trip describes only what happened after the restart.
      */
-    fun handOverTrip(tripId: Long, startedAtMs: Long) {
+    fun handOverTrip(tripId: Long, startedAtMs: Long, odometerM: Double = 0.0, turns: Int = 0) {
         prefs.edit {
             putLong(KEY_HANDOVER_TRIP, tripId)
             putLong(KEY_HANDOVER_START, startedAtMs)
             putLong(KEY_HANDOVER_AT, System.currentTimeMillis())
+            putFloat(KEY_HANDOVER_ODOMETER, odometerM.toFloat())
+            putInt(KEY_HANDOVER_TURNS, turns)
         }
     }
 
@@ -117,18 +123,22 @@ class RuntimeSettings(context: Context) {
      * Consumed once: a handover older than [HANDOVER_VALID_MS] belongs to a drive that has ended,
      * and picking it up would staple today's cars onto yesterday's route.
      */
-    fun consumeTripHandover(nowMs: Long): Pair<Long, Long>? {
+    fun consumeTripHandover(nowMs: Long): TripHandover? {
         val tripId = prefs.getLong(KEY_HANDOVER_TRIP, 0L)
         val startedAt = prefs.getLong(KEY_HANDOVER_START, 0L)
         val savedAt = prefs.getLong(KEY_HANDOVER_AT, 0L)
+        val odometer = prefs.getFloat(KEY_HANDOVER_ODOMETER, 0f).toDouble()
+        val turns = prefs.getInt(KEY_HANDOVER_TURNS, 0)
         prefs.edit {
             remove(KEY_HANDOVER_TRIP)
             remove(KEY_HANDOVER_START)
             remove(KEY_HANDOVER_AT)
+            remove(KEY_HANDOVER_ODOMETER)
+            remove(KEY_HANDOVER_TURNS)
         }
         if (tripId <= 0L || startedAt <= 0L) return null
         if (nowMs - savedAt > HANDOVER_VALID_MS) return null
-        return tripId to startedAt
+        return TripHandover(tripId, startedAt, odometer, turns)
     }
 
     fun setTailSeconds(value: Int): Int {
@@ -230,6 +240,8 @@ class RuntimeSettings(context: Context) {
         private const val KEY_HANDOVER_TRIP = "handover_trip_id"
         private const val KEY_HANDOVER_START = "handover_trip_start"
         private const val KEY_HANDOVER_AT = "handover_saved_at"
+        private const val KEY_HANDOVER_ODOMETER = "handover_odometer_m"
+        private const val KEY_HANDOVER_TURNS = "handover_turns"
         private const val KEY_RESTART_COUNT = "process_restart_count"
         private const val KEY_RESTART_WINDOW_AT = "process_restart_window_at"
 

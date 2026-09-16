@@ -23,7 +23,6 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.doOnLayout
-import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.lensalpr.app.alpr.AlprEngine
@@ -71,20 +70,21 @@ import com.lensalpr.app.settings.ScanConfig
 import com.lensalpr.app.telegram.BotHost
 import com.lensalpr.app.telegram.BotSettings
 import com.lensalpr.app.telegram.TelegramBot
+import com.lensalpr.app.telegram.TelegramClient
 import com.lensalpr.app.track.GeoFix
 import com.lensalpr.app.track.TripTracker
 import com.lensalpr.app.track.TurnEvent
 import com.lensalpr.app.ui.PlateSpeech
 import com.lensalpr.app.ui.VehicleAdapter
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import kotlin.system.exitProcess
 import java.util.concurrent.TimeUnit
@@ -134,10 +134,54 @@ class ScanActivity : AppCompatActivity() {
     @Volatile
     private var voiceState: String? = null
 
-    private val evidenceByPlate = HashMap<String, FollowEvidence>()
+    /** Written on main, read by the bot's retry lane when it asks whether a car was dismissed. */
+    private val evidenceByPlate = ConcurrentHashMap<String, FollowEvidence>()
 
     /** Measures the two cropping strategies against each other during ordinary driving. */
     private val cropStats = CropStats()
+
+    /** Set at the top of onDestroy: every callback that lands afterwards has nothing to act on. */
+    @Volatile
+    private var destroyed = false
+
+    /**
+     * When the current blind spell was first noticed. Recovery is only ever declared when a frame
+     * has actually passed the gate *since then* — a rebind used to rebase the clock and count
+     * as a recovery on its own, so the ladder reset itself and looped: skip, rebind, "восстановлено",
+     * skip, rebind, for the rest of the drive, without a single plate read.
+     */
+    private var blindDetectedAtMs = 0L
+
+    /** When the camera was last asked to come up; the deadline for its first frame. */
+    private var cameraStartedAtMs = 0L
+
+    /** The final "kill the process" step of a restart, held so closing the app can cancel it. */
+    private var exitPending: Runnable? = null
+
+    /** The alarm armed to bring the app back, held so a cancelled restart can disarm it. */
+    private var restartAlarm: PendingIntent? = null
+
+    /**
+     * The operator, the absence timer or the session asked the recorder to stop. Until the
+     * recorder confirms, the watchdog must not re-arm a segment continuation on the clip that is
+     * being stopped, and the finalize callback must not start the next one.
+     */
+    private var recordingStopRequested = false
+
+    /** The running clip was started by hand; it continues across file limits until stopped. */
+    private var manualRecording = false
+
+    /** When the engine was first seen stuck inside one crop, or zero. */
+    private var ocrStuckSinceMs = 0L
+
+    /** When the clip backlog was last offered to the bot again. */
+    private var lastClipResendMs = SystemClock.elapsedRealtime()
+
+    /** Where the previous camera controller left the generation counter; the next continues it. */
+    private var lastControllerGeneration = 0L
+
+    /** Priority of every utterance still queued in the speech engine, by its id. */
+    private val utterancePriorities = ConcurrentHashMap<String, Int>()
 
     /**
      * Who is behind us right now, refreshed on the main thread so the bot may read it from its own.
@@ -211,8 +255,7 @@ class ScanActivity : AppCompatActivity() {
      * Synchronised: filled on the io thread that queues the upload, drained on the bot's media
      * thread when delivery resolves, read by the sweep on the io thread.
      */
-    private val clipsInFlight: MutableSet<String> =
-        java.util.Collections.synchronizedSet(HashSet())
+    private val clipsInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     /** When a recording failure was last reported, so a stuck encoder cannot spam the chat. */
     private var lastClipFailureMs = 0L
@@ -264,8 +307,21 @@ class ScanActivity : AppCompatActivity() {
     private var controller: CameraController? = null
     private var scheduler: LensRotationScheduler? = null
 
-    private val ioExecutor = Executors.newSingleThreadExecutor { runnable ->
+    private val ioService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "lensalpr-io")
+    }
+
+    /**
+     * The io lane as everybody else sees it.
+     *
+     * A task handed in after `onDestroy` shut the lane down used to throw
+     * `RejectedExecutionException` on whichever thread offered it — the main thread, for a
+     * Telegram command that arrived a moment late — and take the process down with it. Late
+     * work has nothing left to do; it is dropped with a line in the log.
+     */
+    private val ioExecutor = Executor { task ->
+        runCatching { ioService.execute(task) }
+            .onFailure { Log.w(TAG, "io task after shutdown dropped") }
     }
     private val analysisExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "frame-analysis").apply { priority = Thread.NORM_PRIORITY + 2 }
@@ -299,6 +355,7 @@ class ScanActivity : AppCompatActivity() {
         runtime = RuntimeSettings(this)
         // The session keeps the camera; the service keeps the session legal in the background.
         sessionOwner.start()
+        ScanSessionService.stopListener = { onNotificationStop() }
         ScanSessionService.start(this)
         gate = FrameGate(strict = config.strictLens)
         recognition = RecognitionState()
@@ -399,23 +456,36 @@ class ScanActivity : AppCompatActivity() {
         lensLabel = entries.first().step.label
         planEntries = entries
 
-        lifecycleScope.launch {
-            val loaded = withContext(Dispatchers.IO) {
-                runCatching { YoloDetector.create(applicationContext, config) }
-            }
-            val yolo = loaded.getOrElse { error ->
-                Log.e(TAG, "detector unavailable", error)
-                showBanner(
-                    getString(R.string.detector_error, error.message ?: error.javaClass.simpleName),
-                )
-                return@launch
-            }
-            if (isFinishing || isDestroyed) {
-                yolo.close()
-                return@launch
-            }
-            detector = yolo
+        // A plain thread, not a lifecycle-scoped coroutine: cancelling the coroutine on a quick
+        // Back threw away a detector that had just finished loading — the native session it owned
+        // was never closed, and the field it was bound for stayed null so onDestroy could not
+        // close it either. Here the loaded object always reaches the main thread, which either
+        // keeps it or closes it.
+        Thread({
+            val loaded = runCatching { YoloDetector.create(applicationContext, config) }
+            mainHandler.post { onDetectorLoaded(loaded, entries, rearSetup) }
+        }, "yolo-load").start()
+    }
 
+    private fun onDetectorLoaded(
+        loaded: Result<YoloDetector>,
+        entries: List<PlanEntry>,
+        rearSetup: RearCameraSetup,
+    ) {
+        val yolo = loaded.getOrElse { error ->
+            Log.e(TAG, "detector unavailable", error)
+            showBanner(
+                getString(R.string.detector_error, error.message ?: error.javaClass.simpleName),
+            )
+            return
+        }
+        if (destroyed || isFinishing || isDestroyed) {
+            yolo.close()
+            return
+        }
+        detector = yolo
+
+        run {
             val frameProcessor = FrameProcessor(
                 config = config,
                 gate = gate,
@@ -423,7 +493,6 @@ class ScanActivity : AppCompatActivity() {
                 worker = worker,
                 pool = pool,
                 recognition = recognition,
-                lensLabel = { lensLabel },
                 geoStamp = {
                     val fix = tracker?.current
                     if (fix == null) null else doubleArrayOf(fix.lat, fix.lon, fix.odometerM)
@@ -446,10 +515,15 @@ class ScanActivity : AppCompatActivity() {
                 onTick = ::renderRotation,
             )
             rotation.configure(entries)
+            rotation.setPaused(gate.paused)
             scheduler = rotation
 
             val recorder = VideoRecorder(applicationContext, ::onClipFinished, ::onClipFailed)
             videoRecorder = recorder
+
+            // A `/stop` that arrived while the detector was still loading leaves the pipeline
+            // built and the camera unbound; `/go` binds it through resumeSession like any other.
+            if (!sessionRunning) return
 
             val camera = CameraController(
                 context = this@ScanActivity,
@@ -464,10 +538,16 @@ class ScanActivity : AppCompatActivity() {
                 onStepSettled = { step, _ -> rotation.onStepSettled(step) },
                 onError = { message -> showBanner(getString(R.string.camera_error, message)) },
                 videoRecorder = recorder,
+                initialGeneration = lastControllerGeneration,
             )
             controller = camera
+            cameraStartedAtMs = SystemClock.elapsedRealtime()
             // The shared ViewPort is only available once the preview has been measured.
-            camera.prepare { binding.previewView.doOnLayout { rotation.start() } }
+            camera.prepare {
+                binding.previewView.doOnLayout {
+                    if (!destroyed && controller === camera && sessionRunning) rotation.start()
+                }
+            }
             mainHandler.postDelayed({
                 val report = preflightReport()
                 Log.i(TAG, "preflight: " + report.replace('\n', '|'))
@@ -478,8 +558,15 @@ class ScanActivity : AppCompatActivity() {
 
     // ----------------------------------------------------------------- follow
 
+    /**
+     * The follow engine always runs; the setting decides whether it *classifies*.
+     *
+     * Turning "detect tailing" off used to turn off the engine, and with it the only path that
+     * writes a confirmed plate to the database — every car of the drive existed until the screen
+     * closed and then never. The history, the encounter photos and the operator's own lists are
+     * not optional; only the GPS-based verdicts are.
+     */
     private fun startFollowDetection() {
-        if (!config.followEnabled) return
         val trip = TripTracker(this, onFix = ::onGeoFix, onTurn = ::onTurn)
         tracker = trip
         val engine = FollowEngine(
@@ -491,6 +578,7 @@ class ScanActivity : AppCompatActivity() {
             onUpdate = ::onThreat,
             onFollowerConfirmed = ::onFollowerConfirmed,
             onFollowerLost = ::onFollowerLost,
+            detectFollowing = config.followEnabled,
         )
         follow = engine
         // A restart that happened seconds ago is the same drive. Continuing its trip keeps the
@@ -498,12 +586,18 @@ class ScanActivity : AppCompatActivity() {
         // a second trip id would make every car still behind us claim "seen on two trips".
         val handover = runtime.consumeTripHandover(System.currentTimeMillis())
         val resumed = handover != null
-        tripStartMs = handover?.second ?: System.currentTimeMillis()
+        tripStartMs = handover?.startedAtMs ?: System.currentTimeMillis()
+        // The kilometres and turns of the trip travel with its id, or the debrief of a drive that
+        // restarted once would describe only the part after the restart.
+        if (handover != null) trip.restore(handover.odometerM, handover.turns)
         ioExecutor.execute {
-            val id = handover?.first
+            val id = handover?.tripId
                 ?: runCatching { store.startTrip(tripStartMs) }.getOrDefault(0L)
             tripId = id
             engine.bindTrip(id)
+            // Trips a dead process left open are closed now, so they age out like any other and
+            // the report does not treat them as still in progress.
+            runCatching { store.closeAbandonedTrips(id) }
             engine.loadBlacklist()
             engine.loadPolice()
             engine.loadIgnored()
@@ -513,14 +607,29 @@ class ScanActivity : AppCompatActivity() {
                 .onSuccess { count -> if (count > 0) Log.i(TAG, "restored $count vehicles from db") }
                 .onFailure { error -> Log.w(TAG, "hydrate failed", error) }
             if (resumed) Log.i(TAG, "resumed trip $id after process restart")
-            runCatching { store.prune(System.currentTimeMillis() - RETENTION_MS) }
+            runCatching { store.prune(System.currentTimeMillis() - RETENTION_MS, id) }
             runCatching { store.mergeDuplicates() }
                 .onSuccess { count -> if (count > 0) Log.i(TAG, "merged $count duplicate plates") }
         }
+        if (!config.followEnabled) return
         if (hasLocationPermission()) {
             trip.start()
         } else {
             showBanner(getString(R.string.location_required))
+        }
+    }
+
+    /**
+     * "Stop" tapped in the notification shade. Stopping the service alone left the camera, the
+     * pipeline and the bot running with no notification to show for it; the session is what
+     * has to stop, and a second tap on an idle session closes the screen.
+     */
+    private fun onNotificationStop() {
+        if (destroyed) return
+        if (sessionRunning) {
+            haltSession()
+        } else {
+            finish()
         }
     }
 
@@ -548,6 +657,8 @@ class ScanActivity : AppCompatActivity() {
             return
         }
         if (recorder.start(evidence.plate)) {
+            manualRecording = false
+            recordingStopRequested = false
             showBanner("🎥 Запись: ${evidence.displayPlate}")
             bot?.broadcast(
                 "🎥 <code>${evidence.displayPlate}</code> — ${evidence.level.title()}, начал запись",
@@ -608,8 +719,29 @@ class ScanActivity : AppCompatActivity() {
     private fun onFollowerLost(plate: String) {
         val recorder = videoRecorder ?: return
         if (recorder.currentTarget == plate) {
-            segmentPlate = null
+            stopRecording()
+        }
+    }
+
+    /**
+     * The one way a clip is stopped on purpose. The flag survives until the recorder's own
+     * finalize arrives, so a watchdog tick in between cannot re-arm a continuation and the
+     * finalize cannot start the next segment of a clip somebody just ended.
+     */
+    private fun stopRecording() {
+        val recorder = videoRecorder ?: return
+        segmentPlate = null
+        if (recorder.isRecording) {
+            recordingStopRequested = true
             recorder.stop()
+        }
+    }
+
+    private fun onClipFailed(plate: String, error: Int) {
+        mainHandler.post {
+            recordingStopRequested = false
+            manualRecording = false
+            onClipFailedOnMain(plate, error)
         }
     }
 
@@ -620,42 +752,50 @@ class ScanActivity : AppCompatActivity() {
      * mark this vehicle would be considered "already being filmed" for the rest of the drive and
      * never filmed again, while the banner kept promising a recording that does not exist.
      */
-    private fun onClipFailed(plate: String, error: Int) {
-        mainHandler.post {
-            hideBanner()
-            follow?.noteVideoFinished(plate)
-            segmentPlate = null
-            // Releasing the mark lets the engine try again immediately, which is right — but if
-            // the encoder is broken or the disk is full it will fail again on the next sighting,
-            // two seconds later, for the rest of the drive. The repair must not become the flood.
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastClipFailureMs < CLIP_FAILURE_REPORT_MS) return@post
-            lastClipFailureMs = now
-            bot?.broadcast("⚠️ Не удалось записать видео <code>$plate</code> (код $error)", urgent = true)
-        }
+    private fun onClipFailedOnMain(plate: String, error: Int) {
+        hideBanner()
+        follow?.noteVideoFinished(plate)
+        segmentPlate = null
+        // Releasing the mark lets the engine try again immediately, which is right — but if
+        // the encoder is broken or the disk is full it will fail again on the next sighting,
+        // two seconds later, for the rest of the drive. The repair must not become the flood.
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastClipFailureMs < CLIP_FAILURE_REPORT_MS) return
+        lastClipFailureMs = now
+        bot?.broadcast("⚠️ Не удалось записать видео <code>${TelegramClient.escape(plate)}</code> (код $error)", urgent = true)
     }
 
     private fun onClipFinished(file: File, plate: String, durationMs: Long, hitLimit: Boolean) {
         Log.i(TAG, "clip ${file.name} ${durationMs / 1000}s ${file.length() / 1024}KB limit=$hitLimit")
-        // A clip the recorder ended itself, because the file filled up, is the same situation as
-        // one the session cut on time: the car is still behind us and filming must go on. Without
-        // this the recorder would fall silent for the rest of the pursuit the moment a clip hit
-        // its ceiling.
-        val continues = segmentPlate == plate || (hitLimit && follow?.evidenceFor(plate) != null)
         mainHandler.post {
+            // A clip the recorder ended itself, because the file filled up, is the same situation
+            // as one the session cut on time: the subject is still there and filming must go on.
+            // Without this the recorder would fall silent for the rest of the pursuit the moment a
+            // clip hit its ceiling. A clip somebody *stopped* — the operator, the absence timer,
+            // the session ending — is over, whatever the file did; and a manual clip continues on
+            // the operator's word alone, not on the follow engine's opinion of a label.
+            val manual = manualRecording
+            val stopped = recordingStopRequested
+            recordingStopRequested = false
+            val subjectStillHere = manual || follow?.evidenceFor(plate) != null
+            val allowed = sessionRunning && !destroyed && (manual || runtime.videoEnabled)
+            val continues = !stopped && allowed && (segmentPlate == plate || (hitLimit && subjectStillHere))
+            segmentPlate = null
             if (continues) {
                 // Long tail: keep filming in a new file instead of one clip Telegram will refuse.
-                segmentPlate = null
                 if (videoRecorder?.start(plate) != true) {
                     hideBanner()
+                    manualRecording = false
                     // The follow-up failed, so this car is no longer being filmed; say so, or it
                     // would never be filmed again for the rest of the drive.
                     follow?.noteVideoFinished(plate)
                 }
             } else {
                 hideBanner()
+                manualRecording = false
                 follow?.noteVideoFinished(plate)
             }
+            refreshRecordButton()
         }
         deliverClip(file, evidenceByPlate[plate]?.displayPlate ?: plate, durationMs)
     }
@@ -759,11 +899,13 @@ class ScanActivity : AppCompatActivity() {
             // No bot yet means the note stays on disk for the next start, rather than vanishing
             // unread — a crash during startup is exactly when the bot is not connected.
             val active = bot ?: return@execute
+            // Escaped: a stack trace is full of `<init>` and generics, and unescaped it was
+            // invalid HTML that Telegram refused — so the one message about the crash was the
+            // one that never arrived. And the note is deleted only once somebody has read it.
             active.broadcast(
-                "💥 <b>Прошлая сессия упала</b>\n<pre>${report.take(1200)}</pre>",
+                "💥 <b>Прошлая сессия упала</b>\n<pre>${TelegramClient.escape(report.take(1200))}</pre>",
                 urgent = true,
-            )
-            CrashReporter.clear(this)
+            ) { delivered -> if (delivered) CrashReporter.clear(this) }
         }
     }
 
@@ -813,6 +955,22 @@ class ScanActivity : AppCompatActivity() {
      * everything that failed accumulated for good: an hour of tailing is around thirty segments,
      * and a week of that fills the phone.
      */
+    /**
+     * Offers the backlog again while driving, not only at start-up.
+     *
+     * A drive that began out of coverage used to keep its clips until the next launch; once the
+     * signal was back nothing tried them again for the rest of the day.
+     */
+    private fun resendClipsIfDue() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastClipResendMs < CLIP_RESEND_INTERVAL_MS) return
+        if (clipsInFlight.isNotEmpty()) return
+        val active = bot ?: return
+        if (active.unreachableForMs(now) > 0L) return
+        lastClipResendMs = now
+        resendPendingClips()
+    }
+
     private fun resendPendingClips() {
         ioExecutor.execute {
             val dir = File(filesDir, "clips")
@@ -956,8 +1114,12 @@ class ScanActivity : AppCompatActivity() {
             stallStrikes = 0
             return
         }
-        val since = SystemClock.elapsedRealtime() - active.lastAnalyzedAtMs
-        if (active.lastAnalyzedAtMs == 0L || since < STALL_LIMIT_MS) {
+        // A camera that never delivered its first frame is judged from the moment it was asked
+        // to start. The zero sentinel used to mean "nothing to check", so a session whose camera
+        // never came up at all was the one session no watchdog ever looked at.
+        val lastFrame = if (active.lastAnalyzedAtMs != 0L) active.lastAnalyzedAtMs else cameraStartedAtMs
+        val since = SystemClock.elapsedRealtime() - lastFrame
+        if (lastFrame == 0L || since < STALL_LIMIT_MS) {
             if (stallStrikes > 0) {
                 stallStrikes = 0
                 lastRebindAtMs = 0L
@@ -975,6 +1137,7 @@ class ScanActivity : AppCompatActivity() {
 
         stallStrikes += 1
         lastRebindAtMs = SystemClock.elapsedRealtime()
+        cameraStartedAtMs = lastRebindAtMs
         Log.w(TAG, "no frames for ${since / 1000}s, recovery attempt $stallStrikes")
         showBanner("📷 Камера молчит ${since / 1000} с — перезапускаю ($stallStrikes)")
         controller?.rebind()
@@ -1015,17 +1178,24 @@ class ScanActivity : AppCompatActivity() {
         // From the last frame that got through, or from the moment this session first saw a frame
         // if none ever has — never from zero, which would read as the phone's whole uptime and
         // declare an outage before the first lens had finished verifying.
-        val since = maxOf(active.lastPassedGateAtMs, active.firstAnalyzedAtMs, gateResumedAtMs)
+        val passed = active.lastPassedGateAtMs
+        val since = maxOf(passed, active.firstAnalyzedAtMs, gateResumedAtMs)
         val blindFor = now - since
-        if (since != 0L && blindFor < BLIND_LIMIT_MS) {
-            val wasBlind = blindStrikes > 0
-            clearBlindState()
-            if (wasBlind) {
+        if (blindStrikes > 0) {
+            // Inside a blind spell only one thing counts as recovery: a frame that actually got
+            // through since the spell began. The grace after a rebind delays the next rung; it
+            // proves nothing, and it used to be mistaken for the cure.
+            if (passed > blindDetectedAtMs) {
+                clearBlindState()
                 hideBanner()
                 bot?.broadcast("🔓 Кадры снова доходят до распознавания", urgent = true)
                 speak("Распознавание восстановлено.")
+                return
             }
-            return
+            if (blindFor < BLIND_LIMIT_MS) return
+        } else {
+            if (since != 0L && blindFor < BLIND_LIMIT_MS) return
+            blindDetectedAtMs = now
         }
         blindStrikes += 1
         // The verifier's own verdict, not a guess from the gate flags. Two drives died this way
@@ -1142,6 +1312,7 @@ class ScanActivity : AppCompatActivity() {
         blindActions = 0
         blindGaveUp = false
         lastBlindActionMs = 0L
+        blindDetectedAtMs = 0L
     }
 
     /** The gate is allowed to open again; give it a clean run before judging it. */
@@ -1162,16 +1333,50 @@ class ScanActivity : AppCompatActivity() {
         }
     }
 
-    /** Starts or stops the manual clip. Main thread only: the recorder has one owner. */
-    private fun toggleRecordingOnMain() {
-        val recorder = videoRecorder ?: return
-        if (recorder.isRecording) {
-            segmentPlate = null
-            recorder.stop()
+    /**
+     * Starts or stops the manual clip. Main thread only: the recorder has one owner.
+     *
+     * Returns what to tell whoever asked — the button or the bot — and says so truthfully: the
+     * old answer was composed before the recorder had been asked, so "🎥 Пишу" went out for a
+     * clip that had been refused for want of space or of a video stream.
+     */
+    private fun toggleRecordingOnMain(): String {
+        val recorder = videoRecorder ?: return "Видео недоступно"
+        val answer = if (recorder.isRecording) {
+            val target = recorder.currentTarget ?: ""
+            stopRecording()
+            "⏹ Останавливаю запись $target".trim()
+        } else if (recorder.videoCapture == null) {
+            "⛔️ Видеопоток недоступен: камера не отдала его при запуске"
+        } else if (recorder.start("manual")) {
+            manualRecording = true
+            recordingStopRequested = false
+            "🎥 Пишу вручную — /rec ещё раз чтобы закончить"
         } else {
-            recorder.start("manual")
+            "⚠️ Запись не началась: мало места или камера отказала"
         }
         refreshRecordButton()
+        return answer
+    }
+
+    /**
+     * Runs [block] on the main thread and waits for its answer, unless we already are there.
+     *
+     * The bot's answers used to be composed on the bot's thread from state the main thread was
+     * about to change: "already stopped" for a /stop that arrived right after /go, "resumed" for
+     * a resume that left the parked sleep in place. The truth lives on one thread; the caller
+     * waits a moment for it rather than guessing.
+     */
+    private fun onMainSync(fallback: String, block: () -> String): String {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        val latch = CountDownLatch(1)
+        val holder = arrayOf(fallback)
+        val posted = mainHandler.post {
+            runCatching { holder[0] = block() }
+            latch.countDown()
+        }
+        if (!posted) return fallback
+        return if (latch.await(MAIN_SYNC_TIMEOUT_MS, TimeUnit.MILLISECONDS)) holder[0] else fallback
     }
 
     /** The record button doubles as the indicator: a stop sign while a clip is being written. */
@@ -1188,7 +1393,9 @@ class ScanActivity : AppCompatActivity() {
             checkRecognitionAlive()
             checkBotReachable()
             maybeRecycleEngine()
+            checkOcrStuck()
             pruneClipsIfDue()
+            resendClipsIfDue()
             val now = System.currentTimeMillis()
             follow?.sweepTurns(now)
             // Unconditional, and not inside the recorder block below: whether a car has left the
@@ -1200,13 +1407,15 @@ class ScanActivity : AppCompatActivity() {
             refreshRecordButton()
             val recorder = videoRecorder
             val target = recorder?.currentTarget
-            if (recorder != null && target != null) {
+            if (recorder != null && target != null && !recordingStopRequested) {
                 if (recorder.elapsedMs > MAX_CLIP_MS) {
                     // Cut a segment instead of growing one file past what Telegram accepts. The
-                    // target is still with us, so recording continues in the next file.
+                    // target is still with us, so recording continues in the next file. Never on
+                    // a clip that is already being stopped: that used to turn the operator's Stop
+                    // back into a continuation.
                     segmentPlate = target
                     recorder.stop()
-                } else {
+                } else if (!manualRecording) {
                     follow?.checkFollowerAbsence(target, System.currentTimeMillis())
                 }
             }
@@ -1265,8 +1474,8 @@ class ScanActivity : AppCompatActivity() {
         sessionRunning = false
         scheduler?.stop()
         // Not a segment break — the session is ending, so the clip must not try to continue.
-        segmentPlate = null
-        videoRecorder?.stop()
+        stopRecording()
+        controller?.let { lastControllerGeneration = it.currentGeneration }
         controller?.shutdown()
         tracker?.stop()
         // Through applyPause for the same reason as the resume side: one place decides what the
@@ -1290,7 +1499,7 @@ class ScanActivity : AppCompatActivity() {
         // parkedPause, so /go from Telegram silently un-paused a session the driver had paused.
         applyPause()
         rebaseBlindClock()
-        tracker?.start()
+        if (config.followEnabled && hasLocationPermission()) tracker?.start()
         hideBanner()
         ScanSessionService.start(this, getString(R.string.service_running))
 
@@ -1302,6 +1511,8 @@ class ScanActivity : AppCompatActivity() {
             onTick = ::renderRotation,
         )
         rotation.configure(planEntries)
+        // The pause the gate is under right now is the pause the new scheduler starts under.
+        rotation.setPaused(gate.paused)
         scheduler = rotation
 
         val camera = CameraController(
@@ -1317,9 +1528,18 @@ class ScanActivity : AppCompatActivity() {
             onStepSettled = { step, _ -> rotation.onStepSettled(step) },
             onError = { message -> showBanner(getString(R.string.camera_error, message)) },
             videoRecorder = recorder,
+            // Continues the numbering of the controller `/stop` shut down, so the frame processor
+            // sees a new generation and starts its tracks over instead of inheriting the cars
+            // that were in the picture before the stop.
+            initialGeneration = lastControllerGeneration,
         )
         controller = camera
-        camera.prepare { binding.previewView.doOnLayout { rotation.start() } }
+        cameraStartedAtMs = SystemClock.elapsedRealtime()
+        camera.prepare {
+            binding.previewView.doOnLayout {
+                if (!destroyed && controller === camera && sessionRunning) rotation.start()
+            }
+        }
     }
 
     private fun onGeoFix(fix: GeoFix) {
@@ -1329,7 +1549,7 @@ class ScanActivity : AppCompatActivity() {
         lastTrackPointMs = fix.tMs
         val trip = tripId
         if (trip == 0L) return
-        val point = TrackPoint(fix.tMs, fix.lat, fix.lon, fix.speedMps)
+        val point = TrackPoint(fix.tMs, fix.lat, fix.lon, fix.speedMps, fix.odometerM)
         ioExecutor.execute { runCatching { store.appendTrackPoint(trip, point) } }
     }
 
@@ -1379,8 +1599,14 @@ class ScanActivity : AppCompatActivity() {
         // A police mark deliberately leaves the threat level alone — a patrol car is not an
         // accusation — so it has to be let past a gate written in terms of that level, or the one
         // list the operator built by hand would be the one thing the app never mentions.
-        val worthSaying = evidence.police || evidence.level.rank >= ThreatLevel.WATCH.rank
+        // "After N separate meetings" is a rule of its own: a car the classifier has no verdict
+        // on is still worth a word on the meeting the operator asked to be told about.
+        val worthSaying = evidence.police ||
+            evidence.level.rank >= ThreatLevel.WATCH.rank ||
+            evidence.encounters >= runtime.alertAfterEncounters
         if (reason == AlertReason.NONE || !worthSaying) return
+        // With tailing detection off, only the operator's own lists may speak.
+        if (!config.followEnabled && !evidence.police && !evidence.blacklisted) return
         announce(evidence, reason)
         val active = bot ?: return
         // A "still behind us" line carries no photo, and it arrives every few seconds. Looking one
@@ -1484,10 +1710,18 @@ class ScanActivity : AppCompatActivity() {
      * The queue has drained: nothing is speaking, so the next line may not be treated as an
      * interruption of anything.
      */
-    private fun onSpeechEnded() {
-        if (tts?.isSpeaking == true) return
+    private fun onSpeechEnded(utteranceId: String?) {
+        utteranceId?.let(utterancePriorities::remove)
+        if (tts?.isSpeaking == true && utterancePriorities.isNotEmpty()) return
+        utterancePriorities.clear()
         speakingPriority = VOICE_PRIORITY_IDLE
         abandonAudioFocus()
+    }
+
+    /** The engine has started a queued line; the rank being spoken is now that line's. */
+    private fun onSpeechStarted(utteranceId: String?) {
+        val priority = utteranceId?.let(utterancePriorities::get) ?: return
+        speakingPriority = priority
     }
 
     /**
@@ -1531,22 +1765,31 @@ class ScanActivity : AppCompatActivity() {
      * *less* important than itself; against an equal it waits its turn, which costs a second or two
      * and is always finished.
      */
-    private fun say(text: String, utteranceId: String, priority: Int) {
-        val engine = tts ?: return
+    private fun say(text: String, utteranceId: String, priority: Int): Boolean {
+        val engine = tts ?: return false
         val mode = if (priority > speakingPriority) {
             TextToSpeech.QUEUE_FLUSH
         } else {
             TextToSpeech.QUEUE_ADD
         }
+        if (mode == TextToSpeech.QUEUE_FLUSH) utterancePriorities.clear()
         if (mode == TextToSpeech.QUEUE_FLUSH || speakingPriority == VOICE_PRIORITY_IDLE) {
             speakingPriority = priority
         }
+        utterancePriorities[utteranceId] = priority
         holdAudioFocus()
-        runCatching { engine.speak(text, mode, null, utteranceId) }
-            .onFailure {
+        // The return code is the only word the engine gives about a line it refused; an ERROR
+        // treated as success marked the alarm as spoken and never spoke it.
+        val accepted = runCatching { engine.speak(text, mode, null, utteranceId) }
+            .getOrDefault(TextToSpeech.ERROR) == TextToSpeech.SUCCESS
+        if (!accepted) {
+            utterancePriorities.remove(utteranceId)
+            if (utterancePriorities.isEmpty()) {
                 speakingPriority = VOICE_PRIORITY_IDLE
                 abandonAudioFocus()
             }
+        }
+        return accepted
     }
 
     private fun initVoice() {
@@ -1591,15 +1834,21 @@ class ScanActivity : AppCompatActivity() {
             // sound, but only a focus request makes another app get quieter for it.
             runCatching {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) = Unit
+                    override fun onStart(utteranceId: String?) {
+                        mainHandler.post { onSpeechStarted(utteranceId) }
+                    }
 
                     override fun onDone(utteranceId: String?) {
-                        mainHandler.post { onSpeechEnded() }
+                        mainHandler.post { onSpeechEnded(utteranceId) }
+                    }
+
+                    override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                        mainHandler.post { onSpeechEnded(utteranceId) }
                     }
 
                     @Suppress("OVERRIDE_DEPRECATION")
                     override fun onError(utteranceId: String?) {
-                        mainHandler.post { onSpeechEnded() }
+                        mainHandler.post { onSpeechEnded(utteranceId) }
                     }
                 })
             }
@@ -1630,7 +1879,11 @@ class ScanActivity : AppCompatActivity() {
         // are the reason the app exists, and a threshold that can silence them is a setting that
         // can turn off the alarm without saying so.
         val insistent = AlertPolicy.isPersistent(evidence.level, evidence.blacklisted || evidence.police)
-        if (!insistent && evidence.level.rank < runtime.alertMinLevel) return
+        // The same two thresholds the chat applies — the level, or the number of separate
+        // meetings — so the voice and the chat agree about which cars are worth a word.
+        val meetsThreshold = evidence.level.rank >= runtime.alertMinLevel ||
+            evidence.encounters >= runtime.alertAfterEncounters
+        if (!insistent && !meetsThreshold) return
         val now = SystemClock.elapsedRealtime()
         val spokenAt = lastSpokenMs[evidence.plate] ?: 0L
         val persistent = insistent
@@ -1648,7 +1901,6 @@ class ScanActivity : AppCompatActivity() {
         // repeats stacked behind an unfinished sentence would drift further and further from the
         // road until the phone was calmly describing a car that left minutes ago.
         if (reason == AlertReason.PRESENT && tts?.isSpeaking == true) return
-        lastSpokenMs[evidence.plate] = now
         val header = when {
             // Police first: if a car is on both lists, "police" is the fact that changes what the
             // driver does next.
@@ -1664,7 +1916,7 @@ class ScanActivity : AppCompatActivity() {
         if (reason == AlertReason.PRESENT) {
             val short = "$header. ${PlateSpeech.spell(evidence.displayPlate)}."
             // A reminder, not news: it never interrupts, it only fills a silence.
-            say(short, evidence.plate, VOICE_PRIORITY_REMINDER)
+            if (say(short, evidence.plate, VOICE_PRIORITY_REMINDER)) lastSpokenMs[evidence.plate] = now
             return
         }
         val line = buildString {
@@ -1693,7 +1945,10 @@ class ScanActivity : AppCompatActivity() {
         }
         // A tail or a listed car outranks a merely suspicious one and the startup chatter, so it
         // cuts in rather than waiting behind them. It does not outrank another tail: see [say].
-        say(line, evidence.plate, if (insistent) VOICE_PRIORITY_ALARM else VOICE_PRIORITY_NOTICE)
+        // Marked as spoken only when the engine accepted the line.
+        if (say(line, evidence.plate, if (insistent) VOICE_PRIORITY_ALARM else VOICE_PRIORITY_NOTICE)) {
+            lastSpokenMs[evidence.plate] = now
+        }
     }
 
     /** Builds the HTML report and hands it to any app that can open or forward it. */
@@ -1848,7 +2103,16 @@ class ScanActivity : AppCompatActivity() {
             }.getOrDefault(0)
             if (undelivered > 0) append("⚠️ не отправлено клипов: $undelivered\n")
             append("${mark(battery)} батарея: ${if (battery) "без ограничений" else "оптимизация включена"}\n")
-            append("${mark(!userPaused)} сканирование: ${if (userPaused) "на паузе" else "идёт"}")
+            bot?.problemText()?.let { problem -> append("⚠️ Telegram: $problem\n") }
+            // Every reason the gate may be shut, not only the button: a stopped session and a
+            // parked sleep used to be reported as "идёт" because the button had not been pressed.
+            val scanning = when {
+                !sessionRunning -> "остановлено (/go чтобы запустить)"
+                userPaused -> "на паузе"
+                parkedPause -> "спит на стоянке"
+                else -> "идёт"
+            }
+            append("${mark(scanning == "идёт")} сканирование: $scanning")
         }
     }
 
@@ -1946,6 +2210,7 @@ class ScanActivity : AppCompatActivity() {
         val active = TelegramBot(
             store = store,
             host = botHost,
+            outboxFile = File(filesDir, "telegram_outbox.json"),
             settings = {
                 BotSettings(
                     token = config.telegramToken,
@@ -2062,6 +2327,8 @@ class ScanActivity : AppCompatActivity() {
                 append("поворотов: ${row.sharedTurns} · возвратов: ${row.reacquisitions}\n")
                 append("поездок: ${row.tripsSeen} · уровень: ${row.level}\n")
                 if (row.blacklisted) append("⛔️ в чёрном списке\n")
+                if (row.police) append("🚔 полиция\n")
+                if (row.ignored) append("🙈 помечена как своя\n")
                 if (hidden > 0) append("(ещё $hidden встреч(и) старше показанных)\n")
                 encounters.forEach { encounter ->
                     val hasPhoto = encounter.photo?.let { File(it).exists() } == true
@@ -2086,10 +2353,14 @@ class ScanActivity : AppCompatActivity() {
         override fun setPolice(plate: String, police: Boolean): String {
             val parsed = com.lensalpr.app.alpr.PlateFormats.parse(plate)
                 ?: return "Не похоже на номер: $plate"
-            mainHandler.post { follow?.setPolice(parsed.key, police) }
             val known = runCatching { store.isKnown(parsed.key) }.getOrDefault(true)
-            ioExecutor.execute {
-                runCatching { store.setPolice(parsed.key, police, parsed.display) }
+            // The engine writes the mark under the row the car actually lives in; a second write
+            // under the typed spelling created a twin row whenever the two differed.
+            val engine = follow
+            if (engine != null) {
+                mainHandler.post { engine.setPolice(parsed.key, police) }
+            } else {
+                ioExecutor.execute { runCatching { store.setPolice(parsed.key, police, parsed.display) } }
             }
             val note = if (known) "" else "\n(машина ещё ни разу не встречалась — сработает при первой встрече)"
             return if (police) {
@@ -2118,12 +2389,15 @@ class ScanActivity : AppCompatActivity() {
         override fun setBlacklist(plate: String, blacklisted: Boolean): String {
             val parsed = com.lensalpr.app.alpr.PlateFormats.parse(plate)
                 ?: return "Не похоже на номер: $plate"
-            mainHandler.post { follow?.setBlacklisted(parsed.key, blacklisted) }
             // Read before the write is queued: the answer has to say whether this is a car the
-            // camera actually knows, and the write itself happens on the io thread.
+            // camera actually knows, and the write itself happens on the io thread — by the
+            // engine, under the row the car actually lives in.
             val known = runCatching { store.isKnown(parsed.key) }.getOrDefault(true)
-            ioExecutor.execute {
-                runCatching { store.setBlacklisted(parsed.key, blacklisted, parsed.display) }
+            val engine = follow
+            if (engine != null) {
+                mainHandler.post { engine.setBlacklisted(parsed.key, blacklisted) }
+            } else {
+                ioExecutor.execute { runCatching { store.setBlacklisted(parsed.key, blacklisted, parsed.display) } }
             }
             val note = if (known) "" else "\n(машина ещё ни разу не встречалась — сработает при первой встрече)"
             return if (blacklisted) {
@@ -2190,27 +2464,32 @@ class ScanActivity : AppCompatActivity() {
             return holder[0]
         }
 
-        override fun setPaused(paused: Boolean): String {
-            mainHandler.post {
-                userPaused = paused
-                applyPause()
-                binding.btnPause.setText(
-                    if (userPaused) R.string.action_resume else R.string.action_pause,
-                )
-            }
-            return if (paused) "⏸ Распознавание на паузе" else "▶️ Распознавание продолжено"
+        override fun setPaused(paused: Boolean): String = onMainSync(
+            if (paused) "⏸ Распознавание на паузе" else "▶️ Распознавание продолжено",
+        ) {
+            // The same operation the on-screen button performs, parked sleep included: a resume
+            // from the chat used to clear the operator's pause and leave the parking pause on, so
+            // "продолжено" was answered while nothing was being recognised.
+            setUserPaused(paused)
+            if (paused) "⏸ Распознавание на паузе" else "▶️ Распознавание продолжено"
         }
 
         override fun isPaused(): Boolean = userPaused
 
         override fun isSessionRunning(): Boolean = sessionRunning
 
-        override fun setSessionRunning(running: Boolean): String {
+        override fun setSessionRunning(running: Boolean): String = onMainSync(
+            if (running) "🟢 Запускаю сессию" else "🛑 Останавливаю сессию, камера освобождена",
+        ) {
+            // Decided on the thread that owns the flag, or two commands in quick succession
+            // judged each other's outcome and the second one was dropped as "already done".
+            if (destroyed) return@onMainSync "Сканер закрыт"
             if (running == sessionRunning) {
-                return if (running) "Уже работает" else "Уже остановлено"
+                if (running) "Уже работает" else "Уже остановлено"
+            } else {
+                if (running) resumeSession() else haltSession()
+                if (running) "🟢 Запускаю сессию" else "🛑 Останавливаю сессию, камера освобождена"
             }
-            mainHandler.post { if (running) resumeSession() else haltSession() }
-            return if (running) "🟢 Запускаю сессию" else "🛑 Останавливаю сессию, камера освобождена"
         }
 
         override fun nextLens(): String {
@@ -2218,26 +2497,21 @@ class ScanActivity : AppCompatActivity() {
             return "🔀 Переключаю линзу"
         }
 
-        override fun toggleRecording(): String {
-            val recorder = videoRecorder ?: return "Видео недоступно"
+        override fun toggleRecording(): String = onMainSync("🎥 Команда записи отправлена") {
             // Everything else that starts or stops the recorder runs on main; a /rec arriving from
-            // Telegram at the same moment a tail is confirmed must not race it.
-            val answer = if (recorder.isRecording) {
-                "⏹ Останавливаю запись ${recorder.currentTarget ?: ""}".trim()
-            } else {
-                "🎥 Пишу вручную — /rec ещё раз чтобы закончить"
-            }
-            mainHandler.post { toggleRecordingOnMain() }
-            return answer
+            // Telegram at the same moment a tail is confirmed must not race it — and the answer is
+            // the recorder's own, not a guess made before it was asked.
+            if (destroyed) "Сканер закрыт" else toggleRecordingOnMain()
         }
 
         override fun findPlates(query: String): String {
             val trimmed = query.trim()
             if (trimmed.length < 2) return "Что искать? Например: /find 7209"
             val rows = runCatching { store.searchPlates(trimmed) }.getOrDefault(emptyList())
-            if (rows.isEmpty()) return "Ничего не нашёл по «$trimmed»"
+            val shown = TelegramClient.escape(trimmed)
+            if (rows.isEmpty()) return "Ничего не нашёл по «$shown»"
             return buildString {
-                append("🔎 <b>$trimmed</b>\n")
+                append("🔎 <b>$shown</b>\n")
                 rows.forEach { row ->
                     append("<code>${row.displayPlate}</code> — встреч ${row.encounters}")
                     row.makeModel?.let { append(" · $it") }
@@ -2315,10 +2589,13 @@ class ScanActivity : AppCompatActivity() {
         override fun companionsText(): String {
             val escorts = companions
             if (escorts.isEmpty()) {
-                return if (userPaused || !sessionRunning) {
-                    "Сканирование не идёт — сзади не смотрю"
-                } else {
-                    "✅ Рядом чисто — никто не держится"
+                // "Clean" is only an answer while somebody is actually looking. A shut gate, a
+                // dead camera or a blind engine is not a quiet road.
+                val blind = blindStrikes > 0 || stallStrikes > 0 || !AlprEngine.status.isReady
+                return when {
+                    userPaused || parkedPause || !sessionRunning -> "Сканирование не идёт — сзади не смотрю"
+                    blind -> "⚠️ Распознавание сейчас не работает — сзади не смотрю (см. /check)"
+                    else -> "✅ Рядом чисто — никто не держится"
                 }
             }
             return buildString {
@@ -2342,16 +2619,20 @@ class ScanActivity : AppCompatActivity() {
                 ?: return "Не похоже на номер: $plate"
             mainHandler.post {
                 follow?.setIgnored(parsed.key, ignored)
-                // A dismissed car must also stop filming right now, not after the next timeout.
-                if (ignored && videoRecorder?.currentTarget == parsed.key) {
-                    segmentPlate = null
-                    videoRecorder?.stop()
+                // A dismissed car must also stop filming right now, not after the next timeout —
+                // even when the clip was started under the spelling the engine has since
+                // corrected, which is why the recorder's key is resolved through the engine.
+                val target = videoRecorder?.currentTarget
+                if (ignored && target != null && !manualRecording &&
+                    (target == parsed.key || follow?.sameVehicle(target, parsed.key) == true)
+                ) {
+                    stopRecording()
                 }
             }
-            // The bot's polling thread must not wait on the database; the follow engine persists
-            // the same flag anyway, this is only the belt to its braces.
-            ioExecutor.execute {
-                runCatching { store.setIgnored(parsed.key, ignored, parsed.display) }
+            // The engine persists the flag under the car's real row; only without an engine does
+            // the typed spelling go straight to the database.
+            if (follow == null) {
+                ioExecutor.execute { runCatching { store.setIgnored(parsed.key, ignored, parsed.display) } }
             }
             return if (ignored) {
                 "🙈 <code>${parsed.display}</code> — свой, больше не тревожу"
@@ -2373,6 +2654,14 @@ class ScanActivity : AppCompatActivity() {
                 follow?.rename(source.key, target.key, target.display)
                 registry.rename(source.key, target.key, target.display)
                 evidenceByPlate.remove(source.key)
+                // The card must not lose its level and its marks for the seconds until the next
+                // sighting; the engine already knows the car under its new name.
+                follow?.evidenceFor(target.key)?.let { evidenceByPlate[target.key] = it }
+                // A clip in progress about the old spelling follows the car, or the absence timer
+                // would find no such car and stop it a few seconds later — and the segment
+                // continuation would restart it under a name nothing recognises.
+                if (videoRecorder?.currentTarget == source.key) videoRecorder?.retarget(target.key)
+                if (segmentPlate == source.key) segmentPlate = target.key
                 publishVehicles()
             }
             return if (renamed) {
@@ -2411,32 +2700,65 @@ class ScanActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * A wipe is a sequence, not a call: the producers are stopped first, on the thread that
+         * owns them, then the files and rows go on the io lane — behind every write already
+         * queued there, so nothing lands in the database after it was emptied — and only then is
+         * the new trip bound and the engine reset. Running it from the bot's thread in the middle
+         * of everything used to leave a recording writing into a deleted file, sightings filed
+         * against a deleted trip, and the trip odometer still counting the old drive.
+         */
         override fun wipeAll(): String {
-            val stats = runCatching { StorageCleaner.wipe(applicationContext, store) }
-                .getOrElse { error ->
-                    Log.e(TAG, "wipe failed", error)
-                    return "Не смог очистить: ${error.message ?: error.javaClass.simpleName}"
-                }
-            spillStore.reset()
-            // The old trip row is gone; keep writing into a fresh one instead of a dangling id.
-            val now = System.currentTimeMillis()
-            tripStartMs = now
-            val trip = runCatching { store.startTrip(now) }.getOrDefault(0L)
-            tripId = trip
-            cropStats.reset()
+            if (destroyed) return "Сканер закрыт"
+            val stopped = CountDownLatch(1)
             mainHandler.post {
+                // Nothing may be mid-write into a file that is about to go.
+                stopRecording()
                 registry.clear()
                 evidenceByPlate.clear()
                 adapter.submitList(emptyList())
-                updatePanelTitle()
-                // Without this the engine keeps judging cars by evidence that no longer exists, and
-                // every new sighting is filed against a trip row that was just deleted.
-                follow?.bindTrip(trip)
-                follow?.reset()
+                stopped.countDown()
             }
-            Log.i(TAG, "wiped: ${stats.describe()}")
-            return "🧹 <b>Очищено</b>\n${stats.describe()}\nНачата новая поездка."
+            stopped.await(MAIN_SYNC_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            val result = arrayOfNulls<String>(1)
+            val done = CountDownLatch(1)
+            ioExecutor.execute {
+                try {
+                    val stats = runCatching { StorageCleaner.wipe(applicationContext, store) }
+                        .getOrElse { error ->
+                            Log.e(TAG, "wipe failed", error)
+                            result[0] = "Не смог очистить: ${error.message ?: error.javaClass.simpleName}"
+                            return@execute
+                        }
+                    spillStore.reset()
+                    // The old trip row is gone; keep writing into a fresh one instead of a dangling id.
+                    val now = System.currentTimeMillis()
+                    val trip = runCatching { store.startTrip(now) }.getOrDefault(0L)
+                    cropStats.reset()
+                    mainHandler.post {
+                        tripStartMs = now
+                        tripId = trip
+                        // Without this the engine keeps judging cars by evidence that no longer
+                        // exists, and every new sighting is filed against a trip row that was just
+                        // deleted — and the new trip would start with the old one's kilometres.
+                        follow?.bindTrip(trip)
+                        follow?.reset()
+                        tracker?.resetTrip()
+                        updatePanelTitle()
+                    }
+                    Log.i(TAG, "wiped: ${stats.describe()}")
+                    result[0] = "🧹 <b>Очищено</b>\n${stats.describe()}\nНачата новая поездка."
+                } finally {
+                    done.countDown()
+                }
+            }
+            done.await(WIPE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            return result[0] ?: "🧹 Очистка запущена, займёт немного времени"
         }
+
+        override fun isIgnored(plate: String): Boolean =
+            evidenceByPlate[plate]?.ignored == true ||
+                evidenceByPlate.values.any { it.storeKey == plate && it.ignored }
     }
 
     // ---------------------------------------------------------------- recognition
@@ -2454,7 +2776,7 @@ class ScanActivity : AppCompatActivity() {
         val runtime = recognition.peek(job.trackId) ?: return
         // The same reading the card is built from, so the remembered position can never belong to a
         // different plate than the one that was recorded.
-        val box = VehicleRegistry.selectReading(outcome, config.minOcrScore.toFloat())?.box
+        val box = VehicleRegistry.selectReading(outcome, config.minOcrScore.toFloat(), job)?.box
         if (box == null) {
             if (job.narrow) runtime.plateAnchor = null
             return
@@ -2478,7 +2800,9 @@ class ScanActivity : AppCompatActivity() {
         )
         if (anchor != null) {
             runtime.plateAnchor = anchor
-            runtime.anchorAtMs = nowMs
+            // The clock the analysis thread ages the anchor against; the wall-clock `nowMs` of
+            // the history is a different clock, and the difference made the anchor immortal.
+            runtime.anchorAtMs = SystemClock.elapsedRealtime()
         } else if (job.narrow) {
             runtime.plateAnchor = null
         }
@@ -2508,6 +2832,9 @@ class ScanActivity : AppCompatActivity() {
                 // timestamp and a stale odometer would stretch contact across the gap and hand the
                 // car every turn taken in between.
                 val fresh = now - job.submittedAtMs <= SIGHTING_FRESHNESS_MS
+                // The score of *this* read, for the photo taken from this frame; the card's best
+                // score belongs to some earlier, luckier frame.
+                val readScore = if (result.score > 0f) result.score else card?.ocrScore ?: 0f
                 if (card != null && fresh) {
                     follow?.onSighting(
                         capturedAtMs = job.submittedAtMs,
@@ -2523,12 +2850,33 @@ class ScanActivity : AppCompatActivity() {
                         color = card.color,
                         body = card.bodyStyle,
                         country = card.country,
-                        ocrScore = card.ocrScore,
+                        ocrScore = readScore,
                         lens = job.lensLabel,
                         nowMs = now,
                         // The latest look at the car, not the best-scoring one. The card on screen
                         // wants the clearest plate; an encounter photo has to be a picture of that
                         // encounter, or it is not evidence of anything.
+                        thumbnail = card.latestThumbnail ?: card.thumbnail,
+                    )
+                } else if (card != null) {
+                    // Too old to say anything about who is behind us now, but a real observation
+                    // of a real plate at a real time and place: it goes into the history, where a
+                    // crop that waited on disk used to vanish without a trace.
+                    follow?.recordLateSighting(
+                        plate = card.plate,
+                        displayPlate = card.displayPlate,
+                        make = card.make,
+                        model = card.model,
+                        year = card.year,
+                        color = card.color,
+                        body = card.bodyStyle,
+                        country = card.country,
+                        ocrScore = readScore,
+                        lens = job.lensLabel,
+                        capturedAtMs = job.submittedAtMs,
+                        lat = job.lat,
+                        lon = job.lon,
+                        odometerM = job.odometerM,
                         thumbnail = card.latestThumbnail ?: card.thumbnail,
                     )
                 }
@@ -2676,16 +3024,13 @@ class ScanActivity : AppCompatActivity() {
             return
         }
         Log.w(TAG, "restarting process ($attempt/$MAX_PROCESS_RESTARTS): $reason")
-        // Ownership of the trip moves to the process that is about to start.
+        // Ownership of the trip moves to the process that is about to start — with its
+        // kilometres and turns, or the debrief describes only the part after the restart.
         val trip = tripId
-        if (trip > 0L) runtime.handOverTrip(trip, tripStartMs)
+        if (trip > 0L) runtime.handOverTrip(trip, tripStartMs, tracker?.odometerM ?: 0.0, tracker?.turnCount ?: 0)
 
         // Finish the clip properly; a truncated MP4 is not evidence, it is a corrupt file.
-        val recorder = videoRecorder
-        if (recorder?.isRecording == true) {
-            segmentPlate = null
-            runCatching { recorder.stop() }
-        }
+        stopRecording()
 
         val intent = Intent(this, ScanActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
@@ -2701,7 +3046,7 @@ class ScanActivity : AppCompatActivity() {
         // Exact alarms need a permission the platform may withhold, and losing the restart is far
         // worse than a late one: an inexact alarm still fires within minutes on a phone that is
         // awake and plugged into a car, which is exactly the situation here.
-        val armed = runCatching {
+        var armed = runCatching {
             if (alarm != null && alarm.canScheduleExactAlarms()) {
                 alarm.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, fireAt, pending)
                 true
@@ -2710,27 +3055,52 @@ class ScanActivity : AppCompatActivity() {
             }
         }.getOrDefault(false)
         if (!armed) {
-            runCatching { alarm?.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, fireAt, pending) }
-                .onFailure { error ->
-                    Log.e(TAG, "no restart alarm could be armed; the app will stay down", error)
-                    bot?.broadcast(
-                        "⚠️ Не смог поставить будильник на перезапуск — открой приложение вручную.",
-                        urgent = true,
-                    )
-                }
+            armed = runCatching {
+                alarm?.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, fireAt, pending)
+                alarm != null
+            }.getOrDefault(false)
         }
+        if (!armed) {
+            // No alarm means no way back. A process that kills itself now stays dead until
+            // somebody notices; staying up and blind is the lesser evil, and it is said so.
+            Log.e(TAG, "no restart alarm could be armed; staying up instead of restarting")
+            bot?.broadcast(
+                "⚠️ Не смог поставить будильник на перезапуск — приложение остаётся открытым, " +
+                    "перезапусти его вручную. Причина: $spoken.",
+                urgent = true,
+            )
+            return
+        }
+        restartAlarm = pending
 
         // Give the recorder time to write the MP4 index and the bot time to flush its queue, then
-        // go. The alarm above is what brings the app back.
+        // go. The alarm above is what brings the app back. Held in a field so that closing the
+        // app during the drain cancels both the exit and the alarm; without that the app killed
+        // the process the driver had just dismissed and brought itself back from the dead.
         //
         // The bot is deliberately not stopped: `stop()` announces "LensALPR остановлен", which is
         // the opposite of what is happening, and its shutdown would race the exit anyway. The
         // service is stopped so the notification does not outlive the process that owns it.
-        mainHandler.postDelayed({
-            runCatching { ScanSessionService.stop(this) }
-            finish()
-            exitProcess(0)
-        }, RESTART_DRAIN_MS)
+        val startedWaiting = SystemClock.elapsedRealtime()
+        val exit = object : Runnable {
+            override fun run() {
+                if (exitPending !== this) return
+                // The clip's finalize arrives on this looper; wait for it up to a ceiling rather
+                // than hoping a fixed delay was long enough for the encoder.
+                val waited = SystemClock.elapsedRealtime() - startedWaiting
+                if (videoRecorder?.isRecording == true && waited < RESTART_DRAIN_CEILING_MS) {
+                    mainHandler.postDelayed(this, 200L)
+                    return
+                }
+                exitPending = null
+                restartAlarm = null
+                runCatching { ScanSessionService.stop(this@ScanActivity) }
+                finish()
+                exitProcess(0)
+            }
+        }
+        exitPending = exit
+        mainHandler.postDelayed(exit, RESTART_DRAIN_MS)
     }
 
     /** The engine is recognizing again; close the outage and say so where it will be read. */
@@ -2769,18 +3139,55 @@ class ScanActivity : AppCompatActivity() {
      * is actually following us, so a healthy engine is recycled once it has been up long enough to
      * be near its allowance — but never while a vehicle is being tracked or filmed.
      */
+    /**
+     * Notices an engine that went into a crop and never came out.
+     *
+     * A native call cannot be interrupted, so the only cure is a new process; but the first
+     * duty is to say so, because from every other signal — camera fine, gate open, bot answering
+     * — a hung engine is an empty road.
+     */
+    private fun checkOcrStuck() {
+        if (!sessionRunning) return
+        val now = SystemClock.elapsedRealtime()
+        val since = worker.currentJobSinceMs
+        if (since == 0L || now - since < OCR_STUCK_MS) {
+            ocrStuckSinceMs = 0L
+            return
+        }
+        if (ocrStuckSinceMs == 0L) {
+            ocrStuckSinceMs = now
+            Log.e(TAG, "engine has been inside one crop for ${(now - since) / 1000}s")
+            showBanner("🛑 Движок ALPR завис на одном кадре")
+            bot?.broadcast(
+                "🛑 Движок ALPR завис на одном кадре уже ${(now - since) / 1000} с. " +
+                    "Номера не читаются; если не отпустит, перезапущу приложение.",
+                urgent = true,
+            )
+            speak("Внимание. Движок распознавания завис.")
+            return
+        }
+        if (now - ocrStuckSinceMs >= OCR_STUCK_RESTART_MS) {
+            ocrStuckSinceMs = 0L
+            restartProcess("движок завис на кадре", "движок распознавания завис")
+        }
+    }
+
     private fun maybeRecycleEngine() {
         if (!sessionRunning) return
         val now = SystemClock.elapsedRealtime()
         val status = AlprEngine.status
+        // The initialization clock belongs to one attempt. It used to survive INITIALIZING → ERROR
+        // → INITIALIZING and add the retries up into a "hung" verdict about an init that had been
+        // running for twenty seconds.
+        if (status.state != AlprEngine.State.INITIALIZING) engineInitSinceMs = 0L
 
         // Health is measured in work, not in minutes. The runtime limit is only ever discovered
         // inside a recognition call, and no crop reaches the engine while the gate is shut — so on
-        // a parking stop, or a pause, an idle engine would sit at READY and "prove" itself without
-        // reading a single plate. Freezing the clock while nothing is being asked of it means the
-        // five minutes below are five minutes of actual recognition.
-        val gateLive = processor?.let { now - it.lastPassedGateAtMs < TRACK_COUNT_FRESH_MS } == true
-        if (engineReadySinceMs != 0L && !gateLive) engineReadySinceMs = now
+        // a parking stop, or a pause, or an empty road, an idle engine would sit at READY and
+        // "prove" itself without reading a single plate. The clock only runs while the engine has
+        // actually answered a crop recently; frames passing the gate prove nothing about it.
+        val engineWorking = now - worker.lastProcessedAtMs < TRACK_COUNT_FRESH_MS
+        if (engineReadySinceMs != 0L && !engineWorking) engineReadySinceMs = now
 
         // A periodic knock that finally stuck. Announced here rather than the moment the engine
         // reports READY, because in this state it reports READY every five minutes and dies on the
@@ -2860,11 +3267,10 @@ class ScanActivity : AppCompatActivity() {
                     "⛔️ Движок ALPR завис на запуске. Перезапускаю приложение.",
                     urgent = true,
                 )
-                restartProcess("движок завис на инициализации")
+                restartProcess("движок завис на инициализации", "движок завис на запуске")
             }
             return
         }
-        engineInitSinceMs = 0L
 
         if (!runtime.enginePreventiveReload) return
         if (engineDownSinceMs != 0L) return
@@ -2945,9 +3351,11 @@ class ScanActivity : AppCompatActivity() {
         val tracked = if (trackCount >= 0) trackCount else 0
         val counts = getString(R.string.hud_counts, adapter.itemCount, tracked)
         // The headline answers the only question that matters while driving: is anyone with me.
+        // "Clean" is a claim, and it is only made while somebody is looking.
         val escort = companions.firstOrNull()
+        val watching = sessionRunning && !userPaused && !parkedPause
         binding.panelTitle.text = if (escort == null) {
-            "$counts\n✅ рядом чисто"
+            if (watching) "$counts\n✅ рядом чисто" else "$counts\n⏸ ${getString(R.string.scan_not_running)}"
         } else {
             val minutes = escort.contactMs / 60_000
             val duration = if (minutes >= 1) "$minutes мин" else "${escort.contactMs / 1000} с"
@@ -2997,7 +3405,12 @@ class ScanActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- controls
 
     private fun togglePause() {
-        userPaused = !userPaused
+        setUserPaused(!userPaused)
+    }
+
+    /** The one manual pause/resume, shared by the button and the bot. Main thread only. */
+    private fun setUserPaused(paused: Boolean) {
+        userPaused = paused
         // "Resume" has to actually resume. The parked sleep is a separate term of the same
         // disjunction, so without clearing it the button did nothing at all whenever the scanner
         // had put itself to sleep — which is exactly when somebody reaches for it.
@@ -3008,6 +3421,7 @@ class ScanActivity : AppCompatActivity() {
         }
         applyPause()
         binding.btnPause.setText(if (userPaused) R.string.action_resume else R.string.action_pause)
+        updatePanelTitle(statusTracked)
     }
 
     private fun applyPause() {
@@ -3089,7 +3503,9 @@ class ScanActivity : AppCompatActivity() {
             .setNegativeButton(
                 if (blacklisted) R.string.action_unblacklist else R.string.action_blacklist,
             ) { _, _ ->
-                follow?.setBlacklisted(card.plate, !blacklisted)
+                // Through the same path the bot uses: it writes the database itself, so the mark
+                // is kept even when the follow engine is not classifying.
+                botHost.setBlacklist(card.plate, !blacklisted)
                 if (!blacklisted) {
                     Toast.makeText(
                         this,
@@ -3114,7 +3530,7 @@ class ScanActivity : AppCompatActivity() {
             // button whose label no longer matches what it would do.
             .also { dialog ->
                 dialogBinding.btnPolice.setOnClickListener {
-                    follow?.setPolice(card.plate, !police)
+                    botHost.setPolice(card.plate, !police)
                     Toast.makeText(
                         this,
                         getString(
@@ -3157,7 +3573,10 @@ class ScanActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // First, before anything is torn down: every callback that lands from here on checks it.
+        destroyed = true
         AlprEngine.removeListener(engineListener)
+        ScanSessionService.stopListener = null
         thermalListener?.let { listener ->
             runCatching {
                 getSystemService(android.os.PowerManager::class.java)?.removeThermalStatusListener(listener)
@@ -3168,11 +3587,24 @@ class ScanActivity : AppCompatActivity() {
         mainHandler.removeCallbacks(recordingWatchdog)
         // The driver closing the app outranks any repair the app had planned for itself. Without
         // this, dismissing the scanner during the grace period would kill the process and then
-        // bring the app straight back from an alarm.
+        // bring the app straight back from an alarm — including the final exit step and the alarm
+        // it had already armed.
         engineRestartPending?.let(mainHandler::removeCallbacks)
         engineRestartPending = null
         processRestartPending?.let(mainHandler::removeCallbacks)
         processRestartPending = null
+        exitPending?.let { exit ->
+            mainHandler.removeCallbacks(exit)
+            exitPending = null
+            restartAlarm?.let { alarm ->
+                runCatching { getSystemService(AlarmManager::class.java)?.cancel(alarm) }
+                runCatching { alarm.cancel() }
+            }
+            restartAlarm = null
+            // The trip was handed to a process that will now never start; take it back so the
+            // next manual launch does not resume a drive that ended here.
+            runtime.consumeTripHandover(System.currentTimeMillis())
+        }
         // Finalizing an MP4 is asynchronous. Give it a moment before the bot is torn down, or the
         // clip recorded seconds before closing the app would never be delivered.
         // The Finalize callback is delivered on this very Looper, so sleeping here could only ever
@@ -3183,6 +3615,9 @@ class ScanActivity : AppCompatActivity() {
         bot?.stop()
         runCatching { tts?.stop() }
         runCatching { tts?.shutdown() }
+        // The focus request outlives the speech engine unless it is given back explicitly; the
+        // car's music stayed ducked after the scanner was closed mid-sentence.
+        abandonAudioFocus()
         val trip = tripId
         val distance = tracker?.odometerM ?: 0.0
         if (trip != 0L) {
@@ -3190,23 +3625,30 @@ class ScanActivity : AppCompatActivity() {
                 runCatching { store.finishTrip(trip, System.currentTimeMillis(), distance) }
             }
         }
-        ioExecutor.shutdown()
+        ioService.shutdown()
         scheduler?.stop()
         controller?.shutdown()
-        analysisExecutor.shutdown()
-        val analysisStopped = runCatching {
-            analysisExecutor.awaitTermination(ANALYSIS_DRAIN_MS, TimeUnit.MILLISECONDS)
-        }.getOrDefault(false)
-        worker.close()
-        // Closing the ONNX session or recycling its bitmaps while a frame is still being detected is
-        // a native use-after-free. If the analysis thread has not finished, leave them to the
-        // process teardown that is about to happen anyway — a leak on exit costs nothing.
-        if (analysisStopped) {
-            processor?.release()
-            detector?.close()
-        } else {
-            Log.w(TAG, "analysis thread still busy; leaving detector to process teardown")
+        // Closing the ONNX session or recycling its bitmaps while a frame is still being detected
+        // is a native use-after-free. The cleanup is therefore queued on the analysis thread itself,
+        // behind whatever frame it is busy with: no frame can follow — the analyzer was cleared
+        // above — and the detector is closed exactly once, by the thread that used it, whether
+        // that happens now or a second later. Waiting on it here with a timeout used to leave the
+        // detector open for good whenever the frame outlasted the timeout and the process lived on.
+        val cleanup = processor
+        val yolo = detector
+        processor = null
+        detector = null
+        runCatching {
+            analysisExecutor.execute {
+                runCatching { cleanup?.release() }
+                runCatching { yolo?.close() }
+            }
+        }.onFailure {
+            runCatching { cleanup?.release() }
+            runCatching { yolo?.close() }
         }
+        analysisExecutor.shutdown()
+        worker.close()
         registry.clear()
         super.onDestroy()
     }
@@ -3354,14 +3796,32 @@ class ScanActivity : AppCompatActivity() {
         /** Time the recorder is given to write the MP4 index before the process dies. */
         const val RESTART_DRAIN_MS = 1_500L
 
+        /** The most the exit waits for a clip that is still finalizing. */
+        const val RESTART_DRAIN_CEILING_MS = 6_000L
+
+        /** How long a bot command waits for the main thread's answer before answering blind. */
+        const val MAIN_SYNC_TIMEOUT_MS = 2_500L
+
+        /** How long a wipe may take before the bot is answered without the result. */
+        const val WIPE_TIMEOUT_MS = 30_000L
+
+        /** How often the undelivered clips are offered to Telegram again while driving. */
+        const val CLIP_RESEND_INTERVAL_MS = 10L * 60_000L
+
+        /** Inside one crop this long, the engine is not slow; it is gone. */
+        const val OCR_STUCK_MS = 45_000L
+
+        /** Stuck this much longer after being reported, the process is restarted. */
+        const val OCR_STUCK_RESTART_MS = 90_000L
+
         /**
          * When the alarm fires, measured from the moment it is armed.
          *
-         * Must be comfortably *after* [RESTART_DRAIN_MS], or the alarm launches the activity in the
-         * process that is about to kill itself — the alarm is then spent, the process dies, and
-         * nothing ever brings the app back.
+         * Must be comfortably *after* the longest the exit can wait for the recorder, or the alarm
+         * launches the activity in the process that is about to kill itself — the alarm is then
+         * spent, the process dies, and nothing ever brings the app back.
          */
-        const val RESTART_ALARM_DELAY_MS = RESTART_DRAIN_MS + 2_500L
+        const val RESTART_ALARM_DELAY_MS = RESTART_DRAIN_CEILING_MS + 3_000L
         const val RESTART_REQUEST_CODE = 0x1E5A
 
         /**
@@ -3396,8 +3856,6 @@ class ScanActivity : AppCompatActivity() {
          */
         const val MAX_CLIP_MS = 90_000L
         const val MAX_RESEND_CLIPS = 5
-        /** How long the analysis thread is given to leave the detector before it is closed. */
-        const val ANALYSIS_DRAIN_MS = 1_200L
 
         /** Delivered clips stay on the phone for a week, then make room for new ones. */
         const val CLIP_RETENTION_MS = 7L * 24 * 3_600_000L

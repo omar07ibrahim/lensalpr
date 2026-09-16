@@ -31,6 +31,7 @@
     <string name="recognition_strict_lens">Распознавать только на подтверждённой линзе</string>
     <string name="recognition_vmmr">Определять марку / модель / цвет</string>
     <string name="recognition_strict_format">Только латвийский формат (AA-1234)</string>
+    <string name="recognition_direct_physical">Прямая привязка физической камеры (эксперимент)</string>
     <string name="section_follow">Слежка и Telegram</string>
     <string name="follow_enabled">Детект слежки (GPS, повороты, возвраты)</string>
     <string name="follow_voice">Голосовые оповещения за рулём</string>
@@ -84,6 +85,7 @@
     <string name="engine_runtime_limited_fatal">Движок ALPR не поднялся — перезапускаю приложение</string>
     <string name="detector_error">Ошибка детектора: %1$s</string>
     <string name="camera_error">Ошибка камеры: %1$s</string>
+    <string name="scan_not_running">сканирование не идёт</string>
     <string name="action_pause">Пауза</string>
     <string name="action_resume">Продолжить</string>
     <string name="action_clear">Очистить</string>
