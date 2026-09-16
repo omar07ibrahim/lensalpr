@@ -372,6 +372,41 @@
                     android:textColor="@color/text_primary"
                     android:textSize="13sp" />
 
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/recognition_region"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+
+                <RadioGroup
+                    android:id="@+id/regionGroup"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <RadioButton
+                        android:id="@+id/rbRegionLv"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/region_lv" />
+
+                    <RadioButton
+                        android:id="@+id/rbRegionLt"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:text="@string/region_lt" />
+
+                    <RadioButton
+                        android:id="@+id/rbRegionEe"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:text="@string/region_ee" />
+                </RadioGroup>
+
                 <com.google.android.material.materialswitch.MaterialSwitch
                     android:id="@+id/switchStrictFormat"
                     android:layout_width="match_parent"

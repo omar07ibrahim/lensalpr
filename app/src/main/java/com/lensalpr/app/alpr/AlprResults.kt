@@ -77,7 +77,8 @@ object AlprJson {
 
     fun parse(
         json: String?,
-        strictLatvia: Boolean = false,
+        strict: Boolean = false,
+        region: PlateRegion = PlateRegion.LATVIA,
     ): Pair<List<PlateReading>, List<CarInfo>> {
         if (json.isNullOrBlank()) return emptyList<PlateReading>() to emptyList()
         val root = runCatching { JSONObject(json) }.getOrNull()
@@ -87,7 +88,7 @@ object AlprJson {
         root.optJSONArray("plates")?.let { array ->
             for (index in 0 until array.length()) {
                 val item = array.optJSONObject(index) ?: continue
-                parsePlate(item, strictLatvia)?.let(plates::add)
+                parsePlate(item, strict, region)?.let(plates::add)
             }
         }
 
@@ -101,11 +102,11 @@ object AlprJson {
         return plates to cars
     }
 
-    private fun parsePlate(item: JSONObject, strictLatvia: Boolean): PlateReading? {
+    private fun parsePlate(item: JSONObject, strict: Boolean, region: PlateRegion): PlateReading? {
         val raw = item.optString("text").trim()
         val country = item.optJSONArray("country")?.optJSONObject(0)
         val countryCode = country?.optString("code")?.nullIfBlank()
-        val plate = PlateFormats.parse(raw, strictLatvia, countryCode) ?: return null
+        val plate = PlateFormats.parse(raw, strict, countryCode, region) ?: return null
         val box = boxOf(item.optJSONArray("warpedBox"))
         if (!plausiblePlateShape(box?.width() ?: 0f, box?.height() ?: 0f)) return null
         val confidences = item.optJSONArray("confidences")

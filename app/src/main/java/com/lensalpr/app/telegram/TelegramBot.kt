@@ -88,6 +88,9 @@ interface BotHost {
 
     /** Corrects a misread plate, or undoes a merge the engine should not have made. */
     fun renamePlate(from: String, to: String): String
+
+    /** Replaces the 12-digit entry password; returns what to answer. */
+    fun setPassword(password: String): String
 }
 
 data class BotSettings(
@@ -172,6 +175,13 @@ class TelegramBot(
 
     @Volatile
     private var muted = false
+
+    /**
+     * Airplane mode: the API is unreachable by design. The poller idles instead of failing every
+     * few seconds, and alerts wait in the outbox for the network to come back.
+     */
+    @Volatile
+    var offline = false
 
     /** Volatile because a restarted poller is a different thread than the one that advanced it. */
     @Volatile
@@ -854,6 +864,10 @@ class TelegramBot(
 
         try {
             while (running) {
+                if (offline) {
+                    runCatching { Thread.sleep(OFFLINE_POLL_MS) }
+                    continue
+                }
                 val startedAt = System.currentTimeMillis()
                 val updates = active.getUpdates(offset).orEmpty()
                 if (updates.isEmpty()) {
@@ -999,6 +1013,14 @@ class TelegramBot(
             "/deladmin" -> removeAdmin(active, update.chatId, argument.toLongOrNull(), isOwner)
             "/mute" -> handleAction(active, update.chatId, "mute:on", isOwner)
             "/unmute" -> handleAction(active, update.chatId, "mute:off", isOwner)
+            "/setpassword", "/password" -> {
+                if (!isOwner) {
+                    active.sendMessage(update.chatId, "Менять пароль может только владелец", panel())
+                } else {
+                    active.sendMessage(update.chatId, host.setPassword(argument), panel())
+                }
+            }
+
             else -> active.sendMessage(update.chatId, HELP, panel())
         }
     }
@@ -1374,6 +1396,9 @@ class TelegramBot(
         /** A car's full history is worth sending about once per drive, not once per reappearance. */
         const val DOSSIER_COOLDOWN_MS = 30L * 60_000L
         const val RETRY_DELAY_MS = 4_000L
+
+        /** How often the idle poller looks again while the phone is in airplane mode. */
+        const val OFFLINE_POLL_MS = 15_000L
         const val MAX_PHOTOS = 6
 
         /** Undelivered alarms held at once; past this the least urgent and oldest is dropped. */
@@ -1419,6 +1444,7 @@ class TelegramBot(
             /storage — сколько занято на телефоне
             /wipe — полная очистка: база, фото, видео, отчёты
             /mute, /unmute — уведомления
+            /setpassword 123456789012 — новый пароль входа в приложение (12 цифр)
             /howto — как проверить слежку на дороге
         """.trimIndent()
 

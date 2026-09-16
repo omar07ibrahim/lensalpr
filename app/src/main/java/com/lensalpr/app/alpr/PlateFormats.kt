@@ -1,5 +1,21 @@
 package com.lensalpr.app.alpr
 
+/** The plate layouts the scanner knows. The operator picks one; the engine's country hint may override it. */
+enum class PlateRegion(val code: String) {
+    LATVIA("LV"),
+    LITHUANIA("LT"),
+    ESTONIA("EE"),
+    ;
+
+    companion object {
+        fun fromCode(code: String?): PlateRegion? {
+            val trimmed = code?.trim()?.takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) }
+                ?: return null
+            return entries.firstOrNull { it.code.equals(trimmed, ignoreCase = true) }
+        }
+    }
+}
+
 /**
  * Turns whatever the OCR returned into a plate - or rejects it.
  *
@@ -8,11 +24,44 @@ package com.lensalpr.app.alpr
  *  * **Rejection.** The engine happily reads any text it finds: on a measured run "0001", "GOOD",
  *    "XAKEP" and "INTERNET" all came back scoring 89, higher than the correct plate. No confidence
  *    threshold separates those from a real plate, but the *shape* does.
- *  * **Correction.** The Latvian layout is letters then digits, so the position of a character says
- *    what it must be. A `O` inside the number block can only be a zero, an `I` can only be a one.
- *    Applying that turns a discarded read into a correct one instead of a wrong one.
+ *  * **Correction.** A layout says which positions are letters and which are digits, so the position
+ *    of a character says what it must be. A `O` inside the number block can only be a zero, an `I`
+ *    can only be a one. Applying that turns a discarded read into a correct one instead of a wrong one.
+ *
+ * Every region is a list of layout masks. Latvia's are strict on purpose — letters then digits, and
+ * that is measured to work. Lithuania's and Estonia's are deliberately looser: both countries issue
+ * several shapes (cars, trailers, motorcycles, older series), and a scanner that only knew the
+ * standard car plate would throw the rest away.
  */
 object PlateFormats {
+
+    /**
+     * One shape a plate can take: `L` a letter, `N` a digit, anything else a separator that is
+     * shown but never part of the comparison key.
+     */
+    private class Layout(val mask: String) {
+        val classes: String = mask.filter { it == 'L' || it == 'N' }
+        val length: Int get() = classes.length
+
+        fun matches(text: String): Boolean {
+            if (text.length != length) return false
+            for (index in text.indices) {
+                val ok = if (classes[index] == 'L') text[index] in 'A'..'Z' else text[index] in '0'..'9'
+                if (!ok) return false
+            }
+            return true
+        }
+
+        /** The text with the layout's separators put back: AA-1234, ABC 123, 123 ABC. */
+        fun display(text: String): String {
+            val out = StringBuilder(mask.length)
+            var index = 0
+            mask.forEach { char ->
+                if (char == 'L' || char == 'N') out.append(text[index++]) else out.append(char)
+            }
+            return out.toString()
+        }
+    }
 
     /**
      * Latvia: 1-4 letters then 2-4 digits - A-1234, AA-12, ABC-123, ABCD-1234.
@@ -20,7 +69,33 @@ object PlateFormats {
      * At least two digits on purpose: a single trailing digit lets a word through. "GOOD" is one
      * ambiguity fix away from "GOO-0", and that is exactly the kind of invention this must not do.
      */
-    private val LATVIA = Regex("^([A-Z]{1,4})([0-9]{2,4})$")
+    private val LATVIA_LAYOUTS: List<Layout> = buildList {
+        for (letters in 1..4) for (digits in 2..4) add(Layout("L".repeat(letters) + "-" + "N".repeat(digits)))
+    }
+
+    /**
+     * Lithuania, loosely: the standard car plate is three letters and three digits (ABC 123), but
+     * trailers carry two letters, motorcycles put the digits first, and older and special series
+     * vary the split. Anything the country issues with letters *and* digits in a plausible order.
+     */
+    private val LITHUANIA_LAYOUTS: List<Layout> = listOf(
+        "LLL NNN", "LL NNN", "NNN LL", "LLL NN", "LL NNNN", "NNNN LL", "LLLL NN",
+    ).map(::Layout)
+
+    /**
+     * Estonia, loosely: the standard car plate is three digits and three letters (123 ABC);
+     * motorcycles and trailers shorten the letter block, older series and transit plates put the
+     * letters first.
+     */
+    private val ESTONIA_LAYOUTS: List<Layout> = listOf(
+        "NNN LLL", "NNN LL", "NN LLL", "NNNN LL", "LLL NNN", "LL NNN", "LLL NN",
+    ).map(::Layout)
+
+    private fun layoutsOf(region: PlateRegion): List<Layout> = when (region) {
+        PlateRegion.LATVIA -> LATVIA_LAYOUTS
+        PlateRegion.LITHUANIA -> LITHUANIA_LAYOUTS
+        PlateRegion.ESTONIA -> ESTONIA_LAYOUTS
+    }
 
     private const val GENERIC_MIN = 4
     private const val GENERIC_MAX = 10
@@ -45,12 +120,15 @@ object PlateFormats {
     data class Plate(
         /** Comparison key: no separators, this is what consensus counts. */
         val key: String,
-        /** What the operator reads: AA-1234. */
+        /** What the operator reads: AA-1234, ABC 123, 123 ABC. */
         val display: String,
-        val latvian: Boolean,
+        /** Which country's layout the text fits, or null for a plate accepted by shape alone. */
+        val region: PlateRegion?,
         /** True when the format resolved an ambiguous character. */
         val corrected: Boolean,
-    )
+    ) {
+        val latvian: Boolean get() = region == PlateRegion.LATVIA
+    }
 
     /**
      * Text that has the shape of a plate but is painted on the road furniture instead.
@@ -61,21 +139,57 @@ object PlateFormats {
      * No confidence threshold separates these from plates; only knowing what they are does.
      */
     private val ROAD_NUMBER = Regex("^[AEP][0-9]{1,3}$")
-    private val PLACE_NAMES = setOf("RIGA", "OGRE", "CESIS", "ADAZI", "SALDUS", "TALSI", "LIMBAZI")
+    private val PLACE_NAMES = setOf(
+        "RIGA", "OGRE", "CESIS", "ADAZI", "SALDUS", "TALSI", "LIMBAZI",
+        "VILNIUS", "KAUNAS", "SIAULIAI", "PANEVEZYS", "TALLINN", "TARTU", "NARVA", "PARNU", "VALGA",
+    )
 
-    /** OCR substitutions require an explicit local format or an LV country hint. */
-    fun parse(raw: String?, strictLatvia: Boolean = false, countryCode: String? = null): Plate? {
+    /**
+     * Parses an OCR read.
+     *
+     * The text is first tried against the layouts of the country the engine named, then of the
+     * configured [region], then — unless [strict] — of every region the scanner knows: a Latvian
+     * car is a Latvian car whether the phone is set to Estonia or not. OCR substitutions (O for 0
+     * and the like) are applied only when a country is known — the engine's hint, or the
+     * configured region in strict mode — because "correcting" a foreign plate into a local shape
+     * invents a car that does not exist. In [strict] mode anything outside the configured region
+     * is refused; otherwise a plausible shape passes as a generic plate.
+     */
+    fun parse(
+        raw: String?,
+        strict: Boolean = false,
+        countryCode: String? = null,
+        region: PlateRegion = PlateRegion.LATVIA,
+    ): Plate? {
         val cleaned = clean(raw) ?: return null
         if (isSignage(cleaned)) return null
-        latvian(cleaned, corrected = false)?.let { return it }
 
-        val corrected = correctToLatvian(cleaned)
-        // A rejected sign must not re-enter through the generic fallback as P1O4 or R1GA12.
-        if (corrected != null && isSignage(corrected.key)) return null
-        val country = countryCode?.trim()?.takeUnless { it.isEmpty() || it.equals("null", true) }
-        val mayCorrect = country.equals("LV", ignoreCase = true) || (strictLatvia && country == null)
-        if (mayCorrect && corrected != null) return corrected
-        if (strictLatvia) return null
+        val hintCode = countryCode?.trim()?.takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) }
+        val hint = PlateRegion.fromCode(hintCode)
+        // The engine named a country this scanner has no layouts for: never repaired into a local
+        // shape, and refused outright in strict mode.
+        val foreign = hintCode != null && hint == null
+
+        if (strict) {
+            exact(cleaned, region)?.let { return it }
+        } else {
+            hint?.let { exact(cleaned, it) }?.let { return it }
+            exact(cleaned, region)?.let { return it }
+            PlateRegion.entries.firstNotNullOfOrNull { exact(cleaned, it) }?.let { return it }
+        }
+
+        // A rejected sign must not re-enter through the generic fallback as P1O4 or R1GA12 —
+        // whatever region is configured, and whether or not a repair is about to be applied.
+        if (PlateRegion.entries.any { candidate -> correct(cleaned, candidate)?.key?.let(::isSignage) == true }) return null
+
+        val correctionRegion = when {
+            hint != null && (!strict || hint == region) -> hint
+            foreign -> null
+            strict -> region
+            else -> null
+        }
+        correctionRegion?.let { correct(cleaned, it) }?.let { return it }
+        if (strict) return null
         return generic(cleaned)
     }
 
@@ -83,7 +197,7 @@ object PlateFormats {
     fun key(raw: String?): String? {
         val cleaned = clean(raw) ?: return null
         if (isSignage(cleaned)) return null
-        return latvian(cleaned, corrected = false)?.key ?: generic(cleaned)?.key
+        return PlateRegion.entries.firstNotNullOfOrNull { exact(cleaned, it) }?.key ?: generic(cleaned)?.key
     }
 
     /**
@@ -110,24 +224,18 @@ object PlateFormats {
         return builder.toString().takeIf { it.isNotEmpty() }
     }
 
-    private fun latvian(text: String, corrected: Boolean): Plate? {
-        LATVIA.matchEntire(text)?.let { match ->
-            return Plate(
-                key = text,
-                display = "${match.groupValues[1]}-${match.groupValues[2]}",
-                latvian = true,
-                corrected = corrected,
-            )
-        }
-        return null
+    private fun exact(text: String, region: PlateRegion): Plate? {
+        val layout = layoutsOf(region).firstOrNull { it.matches(text) } ?: return null
+        return Plate(key = text, display = layout.display(text), region = region, corrected = false)
     }
 
     /**
-     * Tries to make the string valid by resolving characters that the layout leaves no choice
-     * about. Every split point is considered, and the fix is accepted only when it costs at most
-     * [MAX_CORRECTIONS] characters - beyond that it would be inventing a plate, not reading one.
+     * Tries to make the string valid by resolving characters that a layout leaves no choice
+     * about. Every layout of the region is considered, and the fix is accepted only when it costs
+     * at most [MAX_CORRECTIONS] characters - beyond that it would be inventing a plate, not
+     * reading one. Among equally cheap fixes the region's first layout wins.
      */
-    private fun correctToLatvian(text: String): Plate? {
+    private fun correct(text: String, region: PlateRegion): Plate? {
         if (text.length < 3 || text.length > 8) return null
         // Only repair something that already looks like a plate. A word with no digit in it at all
         // is not a misread plate, and "correcting" it would be inventing one.
@@ -135,49 +243,36 @@ object PlateFormats {
         var best: Plate? = null
         var bestCost = MAX_CORRECTIONS + 1
 
-        for (split in 1 until text.length) {
-            val letterPart = text.substring(0, split)
-            val digitPart = text.substring(split)
-            if (letterPart.length > 4 || digitPart.length > 4) continue
-
+        for (layout in layoutsOf(region)) {
+            if (layout.length != text.length) continue
             var cost = 0
-            val letters = StringBuilder()
-            for (char in letterPart) {
+            val fixed = StringBuilder(text.length)
+            for (index in text.indices) {
+                val char = text[index]
+                val wantsLetter = layout.classes[index] == 'L'
                 when {
-                    char in 'A'..'Z' -> letters.append(char)
-                    TO_LETTER.containsKey(char) -> {
-                        letters.append(TO_LETTER.getValue(char)); cost += 1
+                    wantsLetter && char in 'A'..'Z' -> fixed.append(char)
+                    !wantsLetter && char in '0'..'9' -> fixed.append(char)
+                    wantsLetter && TO_LETTER.containsKey(char) -> {
+                        fixed.append(TO_LETTER.getValue(char)); cost += 1
                     }
-                    else -> cost = MAX_CORRECTIONS + 1
-                }
-                if (cost > MAX_CORRECTIONS) break
-            }
-            if (cost > MAX_CORRECTIONS) continue
-
-            val digits = StringBuilder()
-            for (char in digitPart) {
-                when {
-                    char in '0'..'9' -> digits.append(char)
-                    TO_DIGIT.containsKey(char) -> {
-                        digits.append(TO_DIGIT.getValue(char)); cost += 1
+                    !wantsLetter && TO_DIGIT.containsKey(char) -> {
+                        fixed.append(TO_DIGIT.getValue(char)); cost += 1
                     }
                     else -> cost = MAX_CORRECTIONS + 1
                 }
                 if (cost > MAX_CORRECTIONS) break
             }
             if (cost > MAX_CORRECTIONS || cost == 0 || cost >= bestCost) continue
-
-            val fixed = letters.toString() + digits.toString()
-            latvian(fixed, corrected = true)?.let {
-                best = it
-                bestCost = cost
-            }
+            val key = fixed.toString()
+            best = Plate(key = key, display = layout.display(key), region = region, corrected = true)
+            bestCost = cost
         }
         return best
     }
 
     /**
-     * Anything outside the local format still has to look like a plate: a following car may well
+     * Anything outside the known layouts still has to look like a plate: a following car may well
      * be foreign, but a road sign is not a vehicle.
      */
     private fun generic(text: String): Plate? {
@@ -185,6 +280,6 @@ object PlateFormats {
         val digits = text.count { it.isDigit() }
         val letters = text.length - digits
         if (letters < 1 || digits < 2) return null
-        return Plate(key = text, display = text, latvian = false, corrected = false)
+        return Plate(key = text, display = text, region = null, corrected = false)
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Size
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
+import com.lensalpr.app.alpr.PlateRegion
 import com.lensalpr.app.camera.CameraCatalog
 import com.lensalpr.app.camera.RearCameraSetup
 import com.lensalpr.app.telegram.TelegramDefaults
@@ -69,6 +70,8 @@ data class ScanConfig(
     val strictLens: Boolean,
     val vmmr: Boolean,
     val strictPlateFormat: Boolean,
+    /** Whose plate layouts are expected on the road: tried first, and the only ones repaired. */
+    val plateRegion: PlateRegion,
     val allowDirectPhysical: Boolean,
     val followEnabled: Boolean,
     val voiceAlerts: Boolean,
@@ -105,6 +108,7 @@ data class ScanConfig(
             putBoolean(KEY_STRICT, strictLens)
             putBoolean(KEY_VMMR, vmmr)
             putBoolean(KEY_STRICT_FORMAT, strictPlateFormat)
+            putString(KEY_REGION, plateRegion.name)
             putBoolean(KEY_DIRECT_PHYSICAL, allowDirectPhysical)
             putBoolean(KEY_FOLLOW, followEnabled)
             putBoolean(KEY_VOICE, voiceAlerts)
@@ -135,6 +139,7 @@ data class ScanConfig(
         private const val KEY_STRICT = "recognition_strict_lens"
         private const val KEY_VMMR = "recognition_vmmr"
         private const val KEY_STRICT_FORMAT = "recognition_strict_format"
+        private const val KEY_REGION = "recognition_region"
         private const val KEY_DIRECT_PHYSICAL = "camera_direct_physical"
         private const val KEY_FOLLOW = "follow_enabled"
         private const val KEY_VOICE = "follow_voice"
@@ -183,6 +188,7 @@ data class ScanConfig(
                 // Off by default: a car that follows you may well be foreign, and the shape check
                 // already removes the signs and stickers the engine reads as plates.
                 strictPlateFormat = prefs.getBoolean(KEY_STRICT_FORMAT, false),
+                plateRegion = enumOrDefault(prefs.getString(KEY_REGION, null), PlateRegion.LATVIA),
                 allowDirectPhysical = prefs.getBoolean(KEY_DIRECT_PHYSICAL, false),
                 followEnabled = prefs.getBoolean(KEY_FOLLOW, true),
                 voiceAlerts = prefs.getBoolean(KEY_VOICE, true),

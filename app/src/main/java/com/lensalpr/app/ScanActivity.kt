@@ -8,12 +8,16 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.widget.Toast
@@ -52,6 +56,10 @@ import com.lensalpr.app.follow.AlertReason
 import com.lensalpr.app.follow.FollowConfig
 import com.lensalpr.app.follow.FollowEngine
 import com.lensalpr.app.follow.FollowEvidence
+import com.lensalpr.app.lock.LockActivity
+import com.lensalpr.app.lock.LockCrypto
+import com.lensalpr.app.lock.LockPolicy
+import com.lensalpr.app.lock.LockStore
 import com.lensalpr.app.follow.ThreatLevel
 import com.lensalpr.app.pipeline.AlprWorker
 import com.lensalpr.app.pipeline.CropBufferPool
@@ -143,6 +151,16 @@ class ScanActivity : AppCompatActivity() {
     /** Set at the top of onDestroy: every callback that lands afterwards has nothing to act on. */
     @Volatile
     private var destroyed = false
+
+    /** Set once the lock let this activity build itself; before that onDestroy has nothing to tear down. */
+    private var created = false
+
+    /** Airplane mode as last observed; see [applyAirplaneMode]. */
+    private var airplaneMode = false
+    private var airplaneReceiver: BroadcastReceiver? = null
+
+    /** Puts the base banner back once a blacklist or police banner has had its time on screen. */
+    private var markBannerRestore: Runnable? = null
 
     /**
      * When the current blind spell was first noticed. Recovery is only ever declared when a frame
@@ -345,6 +363,14 @@ class ScanActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // A fresh process is locked unless its own restart alarm brought it back: nobody is at
+        // the phone then, and a lock screen would end the session for good.
+        if (!LockStore.unlocked && !LockStore.consumeAutoUnlock(this)) {
+            startActivity(LockActivity.intent(this, LockActivity.TARGET_SCAN))
+            finish()
+            return
+        }
+        created = true
         binding = ActivityScanBinding.inflate(layoutInflater)
         setContentView(binding.root)
         enterImmersiveMode()
@@ -415,6 +441,7 @@ class ScanActivity : AppCompatActivity() {
         reportBuilder = HtmlReportBuilder(applicationContext, store)
         startFollowDetection()
         startBot()
+        watchAirplaneMode()
         reportPreviousCrash()
         warnIfBatteryRestricted()
         resendPendingClips()
@@ -1284,6 +1311,8 @@ class ScanActivity : AppCompatActivity() {
      */
     private fun checkBotReachable() {
         val active = bot ?: return
+        // No network is the expected state of airplane mode, not a fault worth a sentence.
+        if (airplaneMode) return
         val down = active.unreachableForMs(SystemClock.elapsedRealtime())
         if (down < BOT_UNREACHABLE_LIMIT_MS) {
             if (botUnreachableTold) {
@@ -1608,6 +1637,8 @@ class ScanActivity : AppCompatActivity() {
         // With tailing detection off, only the operator's own lists may speak.
         if (!config.followEnabled && !evidence.police && !evidence.blacklisted) return
         announce(evidence, reason)
+        // The two lists the operator wrote by hand also get the screen, not only the voice.
+        if (evidence.police || evidence.blacklisted) showMarkBanner(evidence)
         val active = bot ?: return
         // A "still behind us" line carries no photo, and it arrives every few seconds. Looking one
         // up would put a database read on the io thread at that rate for a picture nobody sends.
@@ -2079,6 +2110,7 @@ class ScanActivity : AppCompatActivity() {
                     "✅ GPS: точность ±${fix.accuracyM.toInt()} м, поворотов ${tracker?.turnCount ?: 0}\n"
                 },
             )
+            if (airplaneMode) append("✈️ режим самолёта: слежка на паузе, только чёрный список и полиция\n")
             append(
                 "${mark(videoRecorder?.videoCapture != null)} видео: " +
                     if (videoRecorder?.videoCapture != null) "готово" else "камера отказала\n",
@@ -2244,6 +2276,7 @@ class ScanActivity : AppCompatActivity() {
                 )
                 append("в кадре: $statusTracked · подтверждено: ${adapter.itemCount}\n")
                 if (userPaused) append("⏸ на паузе\n")
+                if (airplaneMode) append("✈️ режим самолёта: слежка на паузе, только чёрный список и полиция\n")
                 val spilled = spillStore.count
                 if (spilled > 0) append("отложено на диск: $spilled\n")
                 if (trip != null) {
@@ -2612,6 +2645,15 @@ class ScanActivity : AppCompatActivity() {
                     }
                 }
             }
+        }
+
+        override fun setPassword(password: String): String {
+            val pin = password.trim()
+            if (!LockCrypto.isValid(pin)) {
+                return "Пароль — ровно ${LockCrypto.PASSWORD_LENGTH} цифр: /setpassword 123456789012"
+            }
+            LockStore.setPassword(applicationContext, pin)
+            return "🔐 Пароль входа заменён. Попыток до удаления данных: ${LockPolicy.MAX_ATTEMPTS}"
         }
 
         override fun setIgnored(plate: String, ignored: Boolean): String {
@@ -3032,6 +3074,9 @@ class ScanActivity : AppCompatActivity() {
         // Finish the clip properly; a truncated MP4 is not evidence, it is a corrupt file.
         stopRecording()
 
+        // The relaunch happens with nobody at the phone; it must get past the lock screen. An
+        // inexact alarm can fire minutes late, so the token outlives the nominal delay by a margin.
+        LockStore.armAutoUnlock(this, RESTART_ALARM_DELAY_MS + AUTO_UNLOCK_GRACE_MS)
         val intent = Intent(this, ScanActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
@@ -3355,7 +3400,11 @@ class ScanActivity : AppCompatActivity() {
         val escort = companions.firstOrNull()
         val watching = sessionRunning && !userPaused && !parkedPause
         binding.panelTitle.text = if (escort == null) {
-            if (watching) "$counts\n✅ рядом чисто" else "$counts\n⏸ ${getString(R.string.scan_not_running)}"
+            when {
+                !watching -> "$counts\n⏸ ${getString(R.string.scan_not_running)}"
+                airplaneMode -> "$counts\n✈️ только чёрный список"
+                else -> "$counts\n✅ рядом чисто"
+            }
         } else {
             val minutes = escort.contactMs / 60_000
             val duration = if (minutes >= 1) "$minutes мин" else "${escort.contactMs / 1000} с"
@@ -3400,6 +3449,72 @@ class ScanActivity : AppCompatActivity() {
             lastNotifiedBanner = null
             ScanSessionService.start(this, getString(R.string.service_running))
         }
+    }
+
+    // ---------------------------------------------------------------- airplane mode
+
+    /**
+     * Airplane mode is the operator's way of saying "no network, probably no GPS, keep going".
+     *
+     * The scanner keeps recognizing and recording every car, but the route classifier is paused
+     * — every verdict it could reach would rest on evidence that is not being collected — and the
+     * attention goes to the two lists the operator wrote by hand: a car on the blacklist or the
+     * police list is confirmed on its first exact read instead of waiting for consensus, and
+     * shouted at once. The phone also stops complaining about a Telegram it cannot reach.
+     */
+    private fun watchAirplaneMode() {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                applyAirplaneMode(intent.getBooleanExtra("state", isAirplaneModeOn()), announce = true)
+            }
+        }
+        ContextCompat.registerReceiver(
+            this,
+            receiver,
+            IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        airplaneReceiver = receiver
+        registry.priority = { plate -> airplaneMode && follow?.isMarked(plate) == true }
+        applyAirplaneMode(isAirplaneModeOn(), announce = false)
+    }
+
+    private fun isAirplaneModeOn(): Boolean = runCatching {
+        Settings.Global.getInt(contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) == 1
+    }.getOrDefault(false)
+
+    private fun applyAirplaneMode(on: Boolean, announce: Boolean) {
+        if (destroyed || airplaneMode == on) return
+        airplaneMode = on
+        follow?.watchlistOnly = on
+        bot?.offline = on
+        Log.i(TAG, "airplane mode ${if (on) "on" else "off"}")
+        if (on) {
+            showBanner(getString(R.string.airplane_banner))
+            if (announce) speak("Режим самолёта. Слежу только за чёрным списком и полицией.")
+        } else {
+            if (lastNotifiedBanner == getString(R.string.airplane_banner)) hideBanner()
+            if (announce) speak("Режим самолёта выключен. Обычный режим.")
+        }
+        updatePanelTitle(statusTracked)
+    }
+
+    /** A listed car on the screen for a while, then whatever banner was there before. */
+    private fun showMarkBanner(evidence: FollowEvidence) {
+        val text = if (evidence.police) {
+            "🚔 ПОЛИЦИЯ: ${evidence.displayPlate}"
+        } else {
+            "⛔️ ЧЁРНЫЙ СПИСОК: ${evidence.displayPlate}"
+        }
+        showBanner(text)
+        markBannerRestore?.let(mainHandler::removeCallbacks)
+        val restore = Runnable {
+            markBannerRestore = null
+            if (destroyed || binding.statusBanner.text != text) return@Runnable
+            if (airplaneMode) showBanner(getString(R.string.airplane_banner)) else hideBanner()
+        }
+        markBannerRestore = restore
+        mainHandler.postDelayed(restore, MARK_BANNER_MS)
     }
 
     // ---------------------------------------------------------------- controls
@@ -3573,8 +3688,17 @@ class ScanActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (!created) {
+            // Sent to the lock screen from onCreate: nothing below exists yet.
+            super.onDestroy()
+            return
+        }
         // First, before anything is torn down: every callback that lands from here on checks it.
         destroyed = true
+        airplaneReceiver?.let { receiver -> runCatching { unregisterReceiver(receiver) } }
+        airplaneReceiver = null
+        markBannerRestore?.let(mainHandler::removeCallbacks)
+        markBannerRestore = null
         AlprEngine.removeListener(engineListener)
         ScanSessionService.stopListener = null
         thermalListener?.let { listener ->
@@ -3602,8 +3726,10 @@ class ScanActivity : AppCompatActivity() {
             }
             restartAlarm = null
             // The trip was handed to a process that will now never start; take it back so the
-            // next manual launch does not resume a drive that ended here.
+            // next manual launch does not resume a drive that ended here — and that launch has a
+            // human at the phone, so it goes through the lock screen like any other.
             runtime.consumeTripHandover(System.currentTimeMillis())
+            LockStore.disarmAutoUnlock(this)
         }
         // Finalizing an MP4 is asynchronous. Give it a moment before the bot is torn down, or the
         // clip recorded seconds before closing the app would never be delivered.
@@ -3823,6 +3949,12 @@ class ScanActivity : AppCompatActivity() {
          */
         const val RESTART_ALARM_DELAY_MS = RESTART_DRAIN_CEILING_MS + 3_000L
         const val RESTART_REQUEST_CODE = 0x1E5A
+
+        /** How long past the nominal alarm delay a restarted process may still skip the lock. */
+        const val AUTO_UNLOCK_GRACE_MS = 10L * 60_000L
+
+        /** How long a blacklist or police banner keeps the screen before the base banner returns. */
+        const val MARK_BANNER_MS = 30_000L
 
         /**
          * Process restarts allowed inside [RESTART_WINDOW_MS].

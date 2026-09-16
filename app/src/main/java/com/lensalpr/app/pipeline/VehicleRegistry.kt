@@ -62,6 +62,15 @@ class VehicleRegistry(
     enum class Change { NONE, PENDING, CONFIRMED, UPDATED }
 
     /**
+     * Plates that confirm on their first exact read instead of waiting for [requiredMatches]:
+     * the operator's blacklist and police list while the phone is in airplane mode, where being
+     * told a second earlier is the whole point. Read on the main thread, like everything here.
+     */
+    var priority: (String) -> Boolean = { false }
+
+    private fun requiredFor(plate: String): Int = if (priority(plate)) 1 else requiredMatches
+
+    /**
      * The change plus the affected card, so callers do not have to search the snapshot.
      *
      * [score] is the confidence of the read that produced this result — what the encounter photo
@@ -198,7 +207,7 @@ class VehicleRegistry(
             }
         }
 
-        if (count < requiredMatches) {
+        if (count < requiredFor(winner.text)) {
             if (betterFrame) {
                 recycle(state.candidateThumb)
                 state.candidateThumb = job.thumbnail
@@ -301,7 +310,7 @@ class VehicleRegistry(
             val fused = PlateFusion.fuse(history)
             val winner = fused?.reading ?: reading
             val betterFrame = reading.recognitionScore >= parked.state.bestScore
-            if (count < requiredMatches) {
+            if (count < requiredFor(winner.text)) {
                 parked.state.counts[label] = count
                 if (betterFrame) {
                     recycle(parked.state.candidateThumb)
@@ -336,7 +345,7 @@ class VehicleRegistry(
         val count = (orphanCounts[group]?.first ?: 0) + 1
         orphanCounts[group] = count to nowMs
         if (orphanCounts.size > MAX_ORPHAN_GROUPS) orphanCounts.clear()
-        if (count < requiredMatches) {
+        if (count < requiredFor(reading.text)) {
             recycle(job.thumbnail)
             return SubmitResult(Change.PENDING, null, reading.recognitionScore)
         }

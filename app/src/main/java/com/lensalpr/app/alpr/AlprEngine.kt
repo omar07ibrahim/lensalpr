@@ -90,9 +90,13 @@ object AlprEngine {
      */
     private var pendingRequested: String? = null
 
-    /** Whether only the local plate layout is accepted; set from the scan configuration. */
+    /** Whether only the configured country's plate layouts are accepted; set from the scan configuration. */
     @Volatile
-    private var strictLatvia: Boolean = false
+    private var strictFormat: Boolean = false
+
+    /** Whose plate layouts are tried first and repaired; set from the scan configuration. */
+    @Volatile
+    private var plateRegion: PlateRegion = PlateRegion.LATVIA
 
     /**
      * Bumped by every successful initialization.
@@ -159,7 +163,8 @@ object AlprEngine {
     fun initialize(context: Context, config: ScanConfig, force: Boolean = false) {
         val assets = context.applicationContext.assets
         val requested = engineConfig(config).toString()
-        strictLatvia = config.strictPlateFormat
+        strictFormat = config.strictPlateFormat
+        plateRegion = config.plateRegion
         synchronized(stateLock) {
             if (status.state == State.INITIALIZING) {
                 // Remembered, not dropped: the running init finishes with the parameters it was
@@ -295,7 +300,8 @@ object AlprEngine {
     fun reinitializeBlocking(context: Context, config: ScanConfig): Boolean {
         val assets = context.applicationContext.assets
         val requested = engineConfig(config).toString()
-        strictLatvia = config.strictPlateFormat
+        strictFormat = config.strictPlateFormat
+        plateRegion = config.plateRegion
         // isReady rather than the state: a runtime-limited engine would otherwise report success
         // here and the benchmark would silently measure an engine that refuses every frame.
         if (status.isReady && activeConfig == requested) return true
@@ -343,7 +349,7 @@ object AlprEngine {
                     if (code == CODE_RUNTIME_LIMIT) markRuntimeLimited(gen)
                     AlprOutcome.failure(code, result.phrase(), latency)
                 } else {
-                    val (plates, cars) = AlprJson.parse(result.json(), strictLatvia)
+                    val (plates, cars) = AlprJson.parse(result.json(), strictFormat, plateRegion)
                     AlprOutcome(true, code, result.phrase(), plates, cars, latency)
                 }
             } catch (error: Throwable) {

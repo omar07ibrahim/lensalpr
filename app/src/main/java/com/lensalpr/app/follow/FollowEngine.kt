@@ -276,6 +276,17 @@ class FollowEngine(
         .filter { it.level != ThreatLevel.IGNORE }
         .sortedWith(compareByDescending<FollowEvidence> { it.level.rank }.thenByDescending { it.lastSeenMs })
 
+    /**
+     * Airplane mode: no network and usually no GPS. The route classifier is paused — every
+     * verdict it could reach would rest on evidence that is not being collected — while sightings
+     * are still recorded and the operator's own lists still shout. Levels already earned stay.
+     */
+    @Volatile
+    var watchlistOnly: Boolean = false
+
+    /** On the operator's blacklist or police list, under the engine's own key. Main thread. */
+    fun isMarked(plate: String): Boolean = states[plate]?.let { it.blacklisted || it.police } == true
+
     fun evidenceFor(plate: String): FollowEvidence? = states[plate]?.let(::toEvidence)
 
     /** Whether two keys name the same car as far as this engine is concerned. */
@@ -1104,7 +1115,7 @@ class FollowEngine(
     private fun classify(state: State, nowMs: Long): ThreatLevel {
         if (state.ignored) return ThreatLevel.IGNORE
         // No GPS evidence was ever asked for: nothing below is a verdict this engine may reach.
-        if (!detectFollowing) return ThreatLevel.IGNORE
+        if (!detectFollowing || watchlistOnly) return ThreatLevel.IGNORE
         val contactMs = state.contactMs()
         val contactM = state.contactM()
 

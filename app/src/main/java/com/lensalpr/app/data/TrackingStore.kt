@@ -1217,9 +1217,12 @@ class TrackingStore(context: Context) {
         val photo: String?,
     )
 
-    private companion object {
-        const val TAG = "LensALPR.Store"
-        const val NAME = "lensalpr.db"
+    companion object {
+        /** The file under databases/; the panic wipe deletes it by name. */
+        const val DATABASE_NAME = "lensalpr.db"
+
+        private const val TAG = "LensALPR.Store"
+        private const val NAME = DATABASE_NAME
         const val VERSION = 5
 
         /** A gap longer than this starts a new encounter with the same vehicle. */

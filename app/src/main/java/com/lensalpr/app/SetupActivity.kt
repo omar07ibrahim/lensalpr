@@ -14,6 +14,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
+import com.lensalpr.app.alpr.PlateRegion
+import com.lensalpr.app.lock.LockActivity
+import com.lensalpr.app.lock.LockStore
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.lensalpr.app.camera.CameraCatalog
 import com.lensalpr.app.camera.CameraHardwareIdentity
@@ -71,6 +74,13 @@ class SetupActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The password comes first, once per process. Finishing here skips straight to onDestroy,
+        // which touches nothing this screen has not built yet.
+        if (!LockStore.unlocked) {
+            startActivity(LockActivity.intent(this, LockActivity.TARGET_SETUP))
+            finish()
+            return
+        }
         binding = ActivitySetupBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -318,6 +328,13 @@ class SetupActivity : AppCompatActivity() {
         }
         binding.switchVmmr.isChecked = config.vmmr
         binding.switchStrictFormat.isChecked = config.strictPlateFormat
+        binding.regionGroup.check(
+            when (config.plateRegion) {
+                PlateRegion.LATVIA -> R.id.rbRegionLv
+                PlateRegion.LITHUANIA -> R.id.rbRegionLt
+                PlateRegion.ESTONIA -> R.id.rbRegionEe
+            },
+        )
         binding.switchDeep.isChecked = config.deepSearch
         binding.switchRectify.isChecked = config.rectifyPlates
         binding.switchStrict.isChecked = config.strictLens
@@ -460,6 +477,11 @@ class SetupActivity : AppCompatActivity() {
             strictLens = binding.switchStrict.isChecked,
             vmmr = binding.switchVmmr.isChecked,
             strictPlateFormat = binding.switchStrictFormat.isChecked,
+            plateRegion = when (binding.regionGroup.checkedRadioButtonId) {
+                R.id.rbRegionLt -> PlateRegion.LITHUANIA
+                R.id.rbRegionEe -> PlateRegion.ESTONIA
+                else -> PlateRegion.LATVIA
+            },
             allowDirectPhysical = binding.switchDirect.isChecked,
             followEnabled = binding.switchFollow.isChecked,
             voiceAlerts = binding.switchVoice.isChecked,
