@@ -35,7 +35,7 @@
     <string name="lock_setup_hint">12 цифр, дважды. Спрашивается при каждом запуске; сменить можно через Telegram-бота командой /setpassword.</string>
     <string name="lock_hint">12 цифр</string>
     <string name="lock_field_hint">••••••••••••</string>
-    <string name="lock_confirm_hint">Повторите пароль</string>
+    <string name="lock_confirm_hint">Ещё раз</string>
     <string name="lock_attempts">Осталось попыток: %1$d. После этого все данные будут удалены.</string>
     <string name="lock_attempts_last">Последняя попытка! Ещё одна ошибка — и все данные будут удалены.</string>
     <string name="lock_wrong">Неверный пароль. Осталось попыток: %1$d</string>

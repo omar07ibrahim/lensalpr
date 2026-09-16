@@ -38,7 +38,7 @@
     <string name="lock_setup_hint">12 digits, entered twice. It is asked on every launch; the Telegram bot can change it with /setpassword.</string>
     <string name="lock_hint">12 digits</string>
     <string name="lock_field_hint">••••••••••••</string>
-    <string name="lock_confirm_hint">Repeat the password</string>
+    <string name="lock_confirm_hint">Once more</string>
     <string name="lock_attempts">Attempts left: %1$d. After that all data is erased.</string>
     <string name="lock_attempts_last">Last attempt! One more mistake erases all data.</string>
     <string name="lock_wrong">Wrong password. Attempts left: %1$d</string>

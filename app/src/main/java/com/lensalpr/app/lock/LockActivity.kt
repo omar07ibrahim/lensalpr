@@ -3,6 +3,7 @@ package com.lensalpr.app.lock
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.Toast
@@ -48,19 +49,36 @@ class LockActivity : AppCompatActivity() {
         }
         setupMode = !LockStore.hasPassword(this)
         binding.btnSubmit.setOnClickListener { submit() }
-        val onDone = { _: View, actionId: Int, _: Any? ->
-            if (actionId == EditorInfo.IME_ACTION_DONE) {
+        // The keyboard's Done/Next button arrives as an action id; a hardware or injected Enter
+        // arrives as IME_NULL with the key event, so both are handled here.
+        binding.editPassword.setOnEditorActionListener { _, actionId, event ->
+            when {
+                actionId == EditorInfo.IME_ACTION_NEXT || (isEnter(actionId, event) && setupMode) -> {
+                    binding.editConfirm.requestFocus()
+                    true
+                }
+                actionId == EditorInfo.IME_ACTION_DONE || isEnter(actionId, event) -> {
+                    submit()
+                    true
+                }
+                else -> false
+            }
+        }
+        binding.editConfirm.setOnEditorActionListener { _, actionId, event ->
+            if (actionId == EditorInfo.IME_ACTION_DONE || isEnter(actionId, event)) {
                 submit()
                 true
             } else {
                 false
             }
         }
-        binding.editPassword.setOnEditorActionListener { view, actionId, _ -> onDone(view, actionId, null) }
-        binding.editConfirm.setOnEditorActionListener { view, actionId, _ -> onDone(view, actionId, null) }
         render()
         binding.editPassword.requestFocus()
     }
+
+    private fun isEnter(actionId: Int, event: KeyEvent?): Boolean =
+        actionId == EditorInfo.IME_NULL && event?.keyCode == KeyEvent.KEYCODE_ENTER &&
+            event.action == KeyEvent.ACTION_DOWN
 
     private fun render() {
         binding.lockError.text = ""
