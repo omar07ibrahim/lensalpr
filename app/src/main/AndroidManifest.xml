@@ -9,8 +9,20 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <!-- The Telegram link is a control channel with no work to finish, so it is not dataSync. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- So the bot is reachable again after the phone restarts on its own in the car. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!--
+      Android forbids a background process from opening an activity. Without this the scanner
+      cannot bring itself back — not after it restarts its own process to clear the engine's
+      runtime limit, and not after a reboot — and the session simply stays down until somebody
+      picks the phone up. Granted by hand from the setup screen; the app works without it, it just
+      cannot recover unattended.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!--
       Used only to bring the scanner back after it deliberately kills its own process — the last
       resort when the recognition engine's runtime allowance cannot be cleared any other way. An
@@ -37,10 +49,17 @@
         android:supportsRtl="false"
         android:theme="@style/Theme.LensAlpr">
 
+        <!--
+          The only way in. Everything else is exported="false" and unreachable until this screen
+          has been satisfied, so the entry code cannot be walked around with an intent.
+        -->
         <activity
-            android:name=".SetupActivity"
+            android:name=".lock.LockActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density"
+            android:excludeFromRecents="true"
             android:exported="true"
+            android:launchMode="singleTask"
+            android:noHistory="true"
             android:screenOrientation="landscape">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -49,15 +68,47 @@
         </activity>
 
         <activity
+            android:name=".SetupActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density"
+            android:exported="false"
+            android:screenOrientation="landscape" />
+
+        <activity
             android:name=".ScanActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density"
             android:exported="false"
             android:screenOrientation="landscape"
             android:theme="@style/Theme.LensAlpr.Fullscreen" />
+
         <service
             android:name=".ScanSessionService"
             android:exported="false"
             android:foregroundServiceType="camera|location" />
+
+        <service
+            android:name=".BotService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Owner's remote control for a private dashcam-style scanner: the
+                    only channel able to unlock the phone, report a tail and stop recording while
+                    the device is unattended in a vehicle." />
+        </service>
+
+        <!--
+          Not direct-boot aware on purpose: the entry code and the bot token live in
+          credential-encrypted storage, which does not exist until the phone itself has been
+          unlocked. Waking before then would only start a service that cannot read either.
+        -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"

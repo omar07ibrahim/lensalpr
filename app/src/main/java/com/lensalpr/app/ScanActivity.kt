@@ -43,6 +43,9 @@ import com.lensalpr.app.camera.SessionLifecycleOwner
 import com.lensalpr.app.camera.VideoRecorder
 import com.lensalpr.app.data.StorageCleaner
 import com.lensalpr.app.data.TrackPoint
+import com.lensalpr.app.data.AppStore
+import com.lensalpr.app.lock.LockActivity
+import com.lensalpr.app.lock.LockStore
 import com.lensalpr.app.data.TrackingStore
 import com.lensalpr.app.data.WipeStats
 import com.lensalpr.app.databinding.ActivityScanBinding
@@ -69,6 +72,7 @@ import com.lensalpr.app.settings.PlannedStep
 import com.lensalpr.app.settings.RuntimeSettings
 import com.lensalpr.app.settings.ScanConfig
 import com.lensalpr.app.telegram.BotHost
+import com.lensalpr.app.telegram.BotHostRouter
 import com.lensalpr.app.telegram.BotSettings
 import com.lensalpr.app.telegram.TelegramBot
 import com.lensalpr.app.track.GeoFix
@@ -120,7 +124,14 @@ class ScanActivity : AppCompatActivity() {
     private var videoRecorder: VideoRecorder? = null
     private var tracker: TripTracker? = null
     private var follow: FollowEngine? = null
-    private var bot: TelegramBot? = null
+    /**
+     * The bot, borrowed rather than owned.
+     *
+     * It lives in [BotService] so that closing this screen — or locking the phone, which closes it
+     * for good — does not take the remote control with it. Every `bot?.` below therefore means
+     * "if the link happens to be up", which was already true and is now true for more reasons.
+     */
+    private val bot: TelegramBot? get() = BotService.bot
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
@@ -281,6 +292,19 @@ class ScanActivity : AppCompatActivity() {
     /** Set when a clip is cut only because it grew too long; recording resumes in a new file. */
     private var segmentPlate: String? = null
 
+    /**
+     * Set when the lock turned this launch away before anything was built.
+     *
+     * `finish()` in onCreate does not skip the rest of the lifecycle: onStart, onStop and onDestroy
+     * still run, and every one of them reaches for a `lateinit` the early return never assigned.
+     * Without this flag the lock screen would be reached by way of a crash.
+     */
+    private var gatedOut = false
+
+    /** Airplane mode as last observed; see [applyAirplaneMode]. */
+    private var airplaneMode = false
+    private var airplaneReceiver: android.content.BroadcastReceiver? = null
+
     private var thermalLevel = 0
     private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
 
@@ -289,6 +313,16 @@ class ScanActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The lock is not a screen you can go around. Both activities are exported="false", but a
+        // notification tap, a task-switcher resume or the restart alarm can still land here, so the
+        // check lives at the entry of each one rather than only in LockActivity.
+        if (!LockStore.unlocked && !LockStore.consumeAutoUnlock(this)) {
+            gatedOut = true
+            startActivity(Intent(this, LockActivity::class.java))
+            finish()
+            return
+        }
+
         binding = ActivityScanBinding.inflate(layoutInflater)
         setContentView(binding.root)
         enterImmersiveMode()
@@ -354,7 +388,7 @@ class ScanActivity : AppCompatActivity() {
         }
 
         requestBatteryExemption()
-        store = TrackingStore(applicationContext)
+        store = AppStore.get(applicationContext)
         reportBuilder = HtmlReportBuilder(applicationContext, store)
         startFollowDetection()
         startBot()
@@ -362,6 +396,7 @@ class ScanActivity : AppCompatActivity() {
         warnIfBatteryRestricted()
         resendPendingClips()
         startThermalWatch()
+        watchAirplaneMode()
         if (config.voiceAlerts) initVoice()
 
         updatePanelTitle()
@@ -1182,6 +1217,21 @@ class ScanActivity : AppCompatActivity() {
     /** The target leaving the picture is exactly the event nothing else would notice. */
     private val recordingWatchdog = object : Runnable {
         override fun run() {
+            // A lock ordered from Telegram has to reach the scanner, not just the screen. The
+            // service that received it cannot touch this activity, and on a phone without the
+            // overlay permission it cannot even raise the lock screen — so the scanner checks for
+            // itself, once a tick, and stops on its own.
+            if (LockStore.isLockedOut(this@ScanActivity)) {
+                Log.w(TAG, "locked out; stopping the session")
+                LockStore.relock()
+                haltSession()
+                startActivity(
+                    Intent(this@ScanActivity, LockActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                )
+                finish()
+                return
+            }
             updateParkedState()
             applyCropStrategy()
             checkCameraAlive()
@@ -1853,6 +1903,74 @@ class ScanActivity : AppCompatActivity() {
     }
 
     /**
+     * Airplane mode is the driver saying "radios off, keep watching".
+     *
+     * With the radios off there is no GPS, so the tail detector loses every input it reasons
+     * from — turns taken, distance travelled in company, whether two meetings were in different
+     * places. Rather than let it keep issuing verdicts on evidence nobody is collecting, the
+     * engine drops to the two hand-made lists: every plate is still read and recorded, and the
+     * phone stays silent unless the car in the mirror is one the operator put on a list in advance.
+     *
+     * The location feed is released as well. It would find nothing and cost battery on a phone
+     * that has just been told to stop using its radios.
+     */
+    private fun watchAirplaneMode() {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+                applyAirplaneMode(
+                    intent?.getBooleanExtra("state", isAirplaneModeOn()) ?: isAirplaneModeOn(),
+                    announce = true,
+                )
+            }
+        }
+        ContextCompat.registerReceiver(
+            this,
+            receiver,
+            android.content.IntentFilter(android.content.Intent.ACTION_AIRPLANE_MODE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        airplaneReceiver = receiver
+        // The mode may already be on when the session starts, and no broadcast is coming for that.
+        applyAirplaneMode(isAirplaneModeOn(), announce = false)
+    }
+
+    private fun isAirplaneModeOn(): Boolean = runCatching {
+        android.provider.Settings.Global.getInt(
+            contentResolver,
+            android.provider.Settings.Global.AIRPLANE_MODE_ON,
+            0,
+        ) == 1
+    }.getOrDefault(false)
+
+    private fun applyAirplaneMode(on: Boolean, announce: Boolean) {
+        if (airplaneMode == on) return
+        airplaneMode = on
+        follow?.watchlistOnly = on
+        if (on) {
+            tracker?.stop()
+            showBanner("✈️ Режим самолёта — только чёрный список и полиция")
+        } else {
+            if (hasLocationPermission()) tracker?.start()
+            hideBanner()
+        }
+        Log.i(TAG, "airplane mode ${if (on) "on" else "off"}")
+        updatePanelTitle(statusTracked)
+        if (!announce) return
+        // Queued by the bot and delivered when the radios come back; the voice line is what the
+        // driver actually gets right now, and it works with no network at all.
+        if (on) {
+            bot?.broadcast(
+                "✈️ Режим самолёта. GPS выключен, слежка на паузе. Номера читаю по-прежнему, " +
+                    "но тревожу только про чёрный список и полицию.",
+            )
+            speak("Режим самолёта. Слежу только за чёрным списком.")
+        } else {
+            bot?.broadcast("📡 Режим самолёта выключен — слежка снова в работе.")
+            speak("Режим самолёта выключен.")
+        }
+    }
+
+    /**
      * Reports heat. Does not act on it.
      *
      * On the rear window in the sun this phone gets hot, and the app used to answer by sampling
@@ -1878,6 +1996,18 @@ class ScanActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Notes how hot the phone is, and says nothing about it.
+     *
+     * A phone filming through glass in a car is hot; that is its normal working state, not news.
+     * The three messages this used to send arrived over and over on a long drive, trained the
+     * driver to swipe Telegram away, and by doing so buried the one message that matters — the
+     * tail alert — in noise about a condition nobody was going to act on. Performance is not
+     * reduced either, so there was never anything to report.
+     *
+     * The level is still tracked: `/check` reports it on request, and the recorder consults it
+     * before starting a clip. Asked for is different from pushed.
+     */
     private fun applyThermal(status: Int) {
         val level = when {
             status >= android.os.PowerManager.THERMAL_STATUS_SEVERE -> 2
@@ -1885,19 +2015,8 @@ class ScanActivity : AppCompatActivity() {
             else -> 0
         }
         if (level == thermalLevel) return
-        val previous = thermalLevel
         thermalLevel = level
-        Log.i(TAG, "thermal status $status (performance unchanged)")
-        when {
-            level >= 2 -> bot?.broadcast(
-                "🔥 Телефон сильно греется. Частоту и запись НЕ снижаю — работаю на полную. " +
-                    "Если система заберёт камеру, придёт отдельное сообщение.",
-            )
-
-            level == 1 && previous == 0 -> bot?.broadcast("🌡 Телефон греется, работаю на полную")
-
-            level == 0 && previous > 0 -> bot?.broadcast("❄️ Остыл")
-        }
+        Log.i(TAG, "thermal status $status (performance unchanged, operator not told)")
     }
 
     /**
@@ -1941,24 +2060,16 @@ class ScanActivity : AppCompatActivity() {
      * The bot answers whenever a token exists, even with the Telegram switch off — that switch mutes
      * alerts, it is not a reason to ignore the owner's commands from the road.
      */
+    /**
+     * Hands this scanner to the bot, rather than starting one.
+     *
+     * The link is owned by [BotService] and outlives this screen; all that happens here is that
+     * the router learns there is now a live scanner to ask. Detaching in onDestroy leaves the bot
+     * answering "scanning is not running" instead of dying.
+     */
     private fun startBot() {
-        if (config.telegramToken.isBlank()) return
-        val active = TelegramBot(
-            store = store,
-            host = botHost,
-            settings = {
-                BotSettings(
-                    token = config.telegramToken,
-                    ownerId = config.telegramOwnerId,
-                    enabled = config.telegramEnabled,
-                    alertMinLevel = runtime.alertMinLevel,
-                    alertAfterEncounters = runtime.alertAfterEncounters,
-                    narrowCrops = runtime.narrowCrops,
-                )
-            },
-        )
-        bot = active
-        active.start()
+        BotService.start(this)
+        BotHostRouter.attach(botHost)
     }
 
     private val botHost = object : BotHost {
@@ -2679,6 +2790,10 @@ class ScanActivity : AppCompatActivity() {
         // Ownership of the trip moves to the process that is about to start.
         val trip = tripId
         if (trip > 0L) runtime.handOverTrip(trip, tripStartMs)
+        // And so does the right to skip the entry code. Nobody is holding the phone when this
+        // happens, so a lock screen would end the drive rather than protect anything. Single use,
+        // refused if the phone is locked out, and refused again once the window passes.
+        LockStore.armAutoUnlock(this, RESTART_ALARM_DELAY_MS + RESTART_DRAIN_MS + 60_000L)
 
         // Finish the clip properly; a truncated MP4 is not evidence, it is a corrupt file.
         val recorder = videoRecorder
@@ -3146,6 +3261,7 @@ class ScanActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (gatedOut) return
         lifecyclePaused = false
         applyPause()
     }
@@ -3157,7 +3273,13 @@ class ScanActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        if (gatedOut) {
+            super.onDestroy()
+            return
+        }
         AlprEngine.removeListener(engineListener)
+        airplaneReceiver?.let { receiver -> runCatching { unregisterReceiver(receiver) } }
+        airplaneReceiver = null
         thermalListener?.let { listener ->
             runCatching {
                 getSystemService(android.os.PowerManager::class.java)?.removeThermalStatusListener(listener)
@@ -3180,7 +3302,9 @@ class ScanActivity : AppCompatActivity() {
         segmentPlate = null
         videoRecorder?.detach()
         tracker?.stop()
-        bot?.stop()
+        // Not stop(): the link belongs to the service and has to survive this screen — locking
+        // the phone destroys this activity, and that is exactly when the bot has to be reachable.
+        BotHostRouter.detach(botHost)
         runCatching { tts?.stop() }
         runCatching { tts?.shutdown() }
         val trip = tripId

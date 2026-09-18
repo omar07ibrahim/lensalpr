@@ -114,4 +114,24 @@
     <string name="crash_text">Tap to bring scanning back</string>
     <string name="crash_channel">Crashes</string>
     <string name="service_stop">Stop</string>
+
+    <!-- Entry lock, the always-on bot service and the overlay permission. -->
+    <string name="lock_title_create">Choose an entry code</string>
+    <string name="lock_title_repeat">Repeat the code</string>
+    <string name="lock_title_enter">Entry code</string>
+    <string name="lock_hint_create">Exactly %1$d digits. Write it down — a forgotten code is cleared only over Telegram.</string>
+    <string name="lock_hint_repeat">Type the same code again.</string>
+    <string name="lock_hint_attempts">Attempts left: %1$d</string>
+    <string name="lock_submit">Unlock</string>
+    <string name="lock_error_format">Exactly %1$d digits required</string>
+    <string name="lock_error_mismatch">Codes did not match. Start again.</string>
+    <string name="lock_error_wrong">Wrong code. Attempts left: %1$d</string>
+    <string name="bot_channel">Telegram link</string>
+    <string name="bot_service_title">LensALPR online</string>
+    <string name="bot_service_text">The bot is answering commands</string>
+    <string name="bot_service_locked">Phone locked — waiting for /unlock</string>
+    <string name="setup_overlay_title">Display over other apps</string>
+    <string name="setup_overlay_body">Without it Android forbids the scanner from starting itself — after a phone reboot, and after the app restarts its own process, the session will not come back without a person.</string>
+    <string name="setup_overlay_button">Allow</string>
+    <string name="setup_overlay_granted">Allowed</string>
 </resources>

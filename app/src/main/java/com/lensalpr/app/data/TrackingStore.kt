@@ -80,6 +80,15 @@ data class AdminRow(val chatId: Long, val title: String, val role: String, val a
 /** Rows removed by a wipe, so the operator sees it really happened. */
 data class DbWipe(val vehicles: Int, val encounters: Int, val sightings: Int, val trips: Int)
 
+/**
+ * The database file name.
+ *
+ * Top-level rather than inside the class, because erasing everything has to delete the file itself
+ * rather than just its rows — a helper still holding a merely-emptied file will happily recreate it
+ * from its page cache on the next write — and the class keeps its companion private.
+ */
+const val DATABASE_NAME = "lensalpr.db"
+
 /** Outcome of persisting one confirmed sighting. */
 data class SightingRecord(
     /** The row this sighting actually landed on: a near-identical read is merged into one car. */
@@ -1058,7 +1067,7 @@ class TrackingStore(context: Context) {
 
     private companion object {
         const val TAG = "LensALPR.Store"
-        const val NAME = "lensalpr.db"
+        const val NAME = DATABASE_NAME
         const val VERSION = 4
 
         /** A gap longer than this starts a new encounter with the same vehicle. */

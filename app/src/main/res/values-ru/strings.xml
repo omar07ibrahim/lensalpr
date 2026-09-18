@@ -110,4 +110,24 @@
     <string name="crash_text">Нажми, чтобы поднять сканирование</string>
     <string name="crash_channel">Сбои</string>
     <string name="service_stop">Стоп</string>
+
+    <!-- Entry lock, the always-on bot service and the overlay permission. -->
+    <string name="lock_title_create">Придумай код входа</string>
+    <string name="lock_title_repeat">Повтори код</string>
+    <string name="lock_title_enter">Код входа</string>
+    <string name="lock_hint_create">Ровно %1$d цифр. Запиши его — забытый код снимается только через Telegram.</string>
+    <string name="lock_hint_repeat">Введи тот же код ещё раз.</string>
+    <string name="lock_hint_attempts">Осталось попыток: %1$d</string>
+    <string name="lock_submit">Войти</string>
+    <string name="lock_error_format">Нужно ровно %1$d цифр</string>
+    <string name="lock_error_mismatch">Коды не совпали. Начни заново.</string>
+    <string name="lock_error_wrong">Неверный код. Осталось попыток: %1$d</string>
+    <string name="bot_channel">Связь с Telegram</string>
+    <string name="bot_service_title">LensALPR на связи</string>
+    <string name="bot_service_text">Бот отвечает на команды</string>
+    <string name="bot_service_locked">Телефон заблокирован — жду /unlock</string>
+    <string name="setup_overlay_title">Показ поверх других приложений</string>
+    <string name="setup_overlay_body">Без этого Android запрещает сканеру подниматься самому — после перезагрузки телефона и после того, как приложение перезапускает себя, сессия не вернётся без человека.</string>
+    <string name="setup_overlay_button">Разрешить</string>
+    <string name="setup_overlay_granted">Разрешено</string>
 </resources>

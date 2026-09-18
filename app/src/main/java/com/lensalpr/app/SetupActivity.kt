@@ -11,6 +11,8 @@ import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.lensalpr.app.lock.LockActivity
+import com.lensalpr.app.lock.LockStore
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
@@ -50,6 +52,9 @@ class SetupActivity : AppCompatActivity() {
     private var config: ScanConfig? = null
     private val rows = LinkedHashMap<String, RowState>()
 
+    /** Set when the lock turned this launch away; the rest of the lifecycle still runs. */
+    private var gatedOut = false
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { refresh() }
@@ -71,6 +76,15 @@ class SetupActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The lock is not a screen you can go around. Both activities are exported="false", but a
+        // notification tap, a task-switcher resume or the restart alarm can still land here, so the
+        // check lives at the entry of each one rather than only in LockActivity.
+        if (!LockStore.unlocked && !LockStore.consumeAutoUnlock(this)) {
+            gatedOut = true
+            startActivity(Intent(this, LockActivity::class.java))
+            finish()
+            return
+        }
         binding = ActivitySetupBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -91,7 +105,48 @@ class SetupActivity : AppCompatActivity() {
         }
         refresh()
         announceUpdateOnce()
+        askForOverlayPermission()
     }
+
+    /**
+     * Asks, once per launch, for the right to open a window from the background.
+     *
+     * Android forbids a background process from starting an activity, and that single rule breaks
+     * both of the ways this app is supposed to look after itself: coming back after it restarts
+     * its own process to clear the recognition engine's runtime limit, and coming back after the
+     * phone reboots in the car. Without it the scanner stays down until somebody picks the phone
+     * up — which, on a device living on a rear window, may be hours.
+     *
+     * Not a blocker. Everything works without it; only unattended recovery does not, so the dialog
+     * says what is lost and takes "later" for an answer.
+     */
+    private fun askForOverlayPermission() {
+        if (hasOverlayPermission()) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.setup_overlay_title)
+            .setMessage(R.string.setup_overlay_body)
+            .setPositiveButton(R.string.setup_overlay_button) { _, _ ->
+                runCatching {
+                    startActivity(
+                        Intent(
+                            android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            android.net.Uri.parse("package:$packageName"),
+                        ),
+                    )
+                }.onFailure {
+                    // Some vendor ROMs do not ship the per-app screen; the general list is closer
+                    // than nothing.
+                    runCatching {
+                        startActivity(Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
+                    }
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun hasOverlayPermission(): Boolean =
+        runCatching { android.provider.Settings.canDrawOverlays(this) }.getOrDefault(true)
 
     /**
      * Says, exactly once ever, that a new build has been installed and is ready to test.
@@ -160,6 +215,7 @@ class SetupActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (gatedOut) return
         refresh()
     }
 

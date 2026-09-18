@@ -256,6 +256,17 @@ class FollowEngine(
         this.tripId = tripId
     }
 
+    /**
+     * Airplane mode: read everything, judge nothing, shout only about the lists.
+     *
+     * With the radios off there is no GPS, so the route evidence the tail detector is built on
+     * simply is not being collected — and there is no network either, so a verdict could not be
+     * sent anywhere. What still works is recognition and the two hand-made lists, which is exactly
+     * the job the driver wants in this mode: is the car behind me one I already know about.
+     */
+    @Volatile
+    var watchlistOnly: Boolean = false
+
     /** Snapshot for the UI, most dangerous first. */
     fun evidence(): List<FollowEvidence> = states.values
         .map(::toEvidence)
@@ -735,16 +746,23 @@ class FollowEngine(
             recentSightings.removeFirst()
         }
 
+        // The car is still recorded in full — plate, photo, time, place — but in airplane mode the
+        // route classifier is not allowed to reach a verdict about it. Every input it relies on
+        // (turns taken, distance travelled in company, where the meetings were) comes from GPS,
+        // which is off; a level built on absent evidence would be a guess wearing a badge. Levels
+        // earned earlier stand, they simply stop growing.
+        val marked = state.blacklisted || state.police
         state.level = when {
             state.ignored -> ThreatLevel.IGNORE
             state.blacklisted -> ThreatLevel.BLACKLIST
+            watchlistOnly && !marked -> state.level
             // Never downwards. What the engine concluded about a car was concluded from evidence
             // that still stands, and a verdict that could drop and climb again would announce the
             // same car as a fresh promotion every time it did — which is how a repeat alarm turns
             // into a chant. Only the operator's own decisions, handled above, may lower a level.
             else -> maxOf(classify(state), state.level)
         }
-        val reason = AlertPolicy.decide(
+        val decided = AlertPolicy.decide(
             level = state.level,
             previousLevel = previousLevel,
             blacklisted = state.blacklisted,
@@ -755,6 +773,10 @@ class FollowEngine(
             lastAlertedMs = state.lastAlertedMs,
             nowMs = nowMs,
         )
+        // In airplane mode only the operator's own lists speak. The whole point of the mode is a
+        // phone that keeps reading every plate on the road but stays silent about all of them
+        // except the ones a human put on a list beforehand.
+        val reason = if (watchlistOnly && !marked) AlertReason.NONE else decided
         if (reason != AlertReason.NONE) {
             state.lastAlertedMs = nowMs
             state.alertedInSegment = true

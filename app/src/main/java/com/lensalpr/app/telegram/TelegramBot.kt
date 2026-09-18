@@ -103,6 +103,13 @@ data class BotSettings(
 class TelegramBot(
     private val store: TrackingStore,
     private val host: BotHost,
+    /**
+     * The lock, which answers even when [host] cannot.
+     *
+     * Everything else here degrades gracefully when the scanner is gone; this is the one thing
+     * that has to keep working precisely because it is gone.
+     */
+    private val lock: LockControl,
     private val settings: () -> BotSettings,
 ) {
 
@@ -692,8 +699,52 @@ class TelegramBot(
         val command = parts.first().lowercase().substringBefore('@')
         val argument = parts.drop(1).joinToString(" ").trim()
 
+        // A locked-out phone answers only about the lock. Everything else would be reporting on,
+        // or reaching into, a scanner that has been deliberately stopped.
+        if (lock.isLockedOut() && command !in LOCK_COMMANDS) {
+            active.sendMessage(
+                update.chatId,
+                "🔒 Телефон заблокирован: три неверных кода подряд.\n" +
+                    "Открыть — <code>/unlock КОД</code>.",
+            )
+            return
+        }
+
         when (command) {
             "/start", "/menu", "/help" -> active.sendMessage(update.chatId, HELP, panel())
+
+            "/unlock" -> handleUnlock(active, update.chatId, argument)
+
+            "/lock" -> {
+                if (!isOwner) {
+                    active.sendMessage(update.chatId, "Блокировать телефон может только владелец")
+                } else {
+                    lock.lock()
+                    active.sendMessage(
+                        update.chatId,
+                        "🔒 Телефон заблокирован. Экран белый, сканирование остановлено.\n" +
+                            "Открыть — <code>/unlock КОД</code>.",
+                    )
+                }
+            }
+
+            // Two steps, and the second one is typed out in full: this is the only command in the
+            // app that destroys evidence, and it exists so a phone genuinely lost to someone else
+            // can be emptied — not so a fat finger can empty one sitting on the windscreen.
+            "/wipeall" -> {
+                if (!isOwner) {
+                    active.sendMessage(update.chatId, "Стирать данные может только владелец")
+                } else if (argument.trim().uppercase() != WIPE_CONFIRMATION) {
+                    active.sendMessage(
+                        update.chatId,
+                        "🧨 <b>Полное стирание</b>\nБаза, фото, клипы, отчёты, " +
+                            "настройки и код входа исчезнут без возможности вернуть.\n\n" +
+                            "Если точно — пришли:\n<code>/wipeall $WIPE_CONFIRMATION</code>",
+                    )
+                } else {
+                    active.sendMessage(update.chatId, lock.wipeEverything())
+                }
+            }
             "/howto", "/тест", "/test" -> active.sendMessage(update.chatId, HOWTO, panel())
             "/status" -> handleAction(active, update.chatId, "status", isOwner)
             "/photo", "/кадр" -> handleAction(active, update.chatId, "photo", isOwner)
@@ -772,6 +823,35 @@ class TelegramBot(
             "/mute" -> handleAction(active, update.chatId, "mute:on", isOwner)
             "/unmute" -> handleAction(active, update.chatId, "mute:off", isOwner)
             else -> active.sendMessage(update.chatId, HELP, panel())
+        }
+    }
+
+    /**
+     * Opens a locked-out phone from a chat message.
+     *
+     * Deliberately does not spend one of the three on-device attempts: those belong to whoever is
+     * holding the phone, and a mistyped digit here must not bring the owner closer to being shut
+     * out of their own scanner. A wrong code is answered plainly, with no hint about its length or
+     * how close it came.
+     */
+    private fun handleUnlock(active: TelegramClient, chatId: Long, argument: String) {
+        val code = argument.trim()
+        if (code.isEmpty()) {
+            active.sendMessage(chatId, "Формат: <code>/unlock КОД</code>")
+            return
+        }
+        if (!lock.isLockedOut()) {
+            active.sendMessage(chatId, "🔓 Телефон и так не заблокирован.", panel())
+            return
+        }
+        if (lock.unlock(code)) {
+            active.sendMessage(
+                chatId,
+                "🔓 Телефон разблокирован. Экран вернулся, сканирование можно запускать.",
+                panel(),
+            )
+        } else {
+            active.sendMessage(chatId, "❌ Неверный код. Попытки на телефоне не потрачены.")
         }
     }
 
@@ -1111,6 +1191,17 @@ class TelegramBot(
     companion object {
         const val TAG = "LensALPR.Bot"
         const val ROLE_ADMIN = "admin"
+        /**
+         * The only commands a locked-out phone will answer.
+         *
+         * `/start` stays so an owner who has forgotten the syntax is told what to type rather than
+         * met with silence.
+         */
+        val LOCK_COMMANDS = setOf("/unlock", "/start", "/help", "/menu")
+
+        /** Typed out in full, so no button and no autocomplete can ever erase the evidence. */
+        const val WIPE_CONFIRMATION = "СТЕРЕТЬ ВСЁ"
+
         const val ALERT_COOLDOWN_MS = 180_000L
 
         /**
