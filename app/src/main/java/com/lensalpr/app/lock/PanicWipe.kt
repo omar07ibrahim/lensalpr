@@ -38,7 +38,7 @@ object PanicWipe {
             val store = AppStore.get(app)
             StorageCleaner.wipe(app, store, keepAdmins = false)
         }.onFailure { Log.w(TAG, "database wipe failed", it) }
-        AppStore.reset()
+        AppStore.closeForWipe()
         runCatching { app.deleteDatabase(DATABASE_NAME) }
 
         // Everything under files/ except the detector models.

@@ -23,15 +23,20 @@ object AppStore {
     }
 
     /**
-     * Drops the shared handle after the database file itself has been deleted.
+     * Closes the shared handle before the database file itself is deleted.
      *
      * A helper still holding a deleted file will happily serve rows from its page cache and then
      * recreate the file on the next write, which is how an "erase everything" leaves data behind.
+     *
+     * The instance itself is deliberately kept. Other components — the bot's service above all —
+     * hold this object for their whole lifetime, and handing the next caller a *different*
+     * TrackingStore would put two SQLiteOpenHelpers back on one file: exactly the race this object
+     * exists to prevent, reintroduced by the cleanup. `SQLiteOpenHelper` reopens on the next query,
+     * so the shared instance simply comes back pointing at a fresh, empty database.
      */
-    fun reset() {
+    fun closeForWipe() {
         synchronized(this) {
             runCatching { instance?.close() }
-            instance = null
         }
     }
 }

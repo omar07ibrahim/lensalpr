@@ -60,6 +60,8 @@ class BotService : Service() {
 
             ACTION_UNLOCKED, ACTION_REFRESH -> startForegroundCompat()
         }
+        // Another chance to connect: the token may have been filled in since the last attempt.
+        startBot()
         // The bot should be the last thing to die when the system is short of memory, and the
         // first to come back.
         return START_STICKY
@@ -72,11 +74,17 @@ class BotService : Service() {
         super.onDestroy()
     }
 
+    /**
+     * Brings the link up, if it can be brought up.
+     *
+     * Idempotent, and retried on every [onStartCommand]: a first launch with no token configured
+     * used to leave the service running and permanently mute, because nothing ever asked again.
+     * Now every screen that starts the service also gives the bot another chance to connect.
+     */
     private fun startBot() {
         if (link != null) return
-        val config = runCatching { ScanConfig.load(this, null) }.getOrNull() ?: return
-        if (config.telegramToken.isBlank()) {
-            Log.i(TAG, "no bot token; the service stays up but silent")
+        if (ScanConfig.telegram(this).token.isBlank()) {
+            Log.i(TAG, "no bot token yet; the service stays up and will retry")
             return
         }
         val runtime = RuntimeSettings(this)
@@ -85,10 +93,13 @@ class BotService : Service() {
             host = BotHostRouter,
             lock = lockControl,
             settings = {
+                // Read every time, not captured: this service outlives the setup screen, so a
+                // token or owner id corrected there has to reach a bot that is already running.
+                val telegram = ScanConfig.telegram(this)
                 BotSettings(
-                    token = config.telegramToken,
-                    ownerId = config.telegramOwnerId,
-                    enabled = config.telegramEnabled,
+                    token = telegram.token,
+                    ownerId = telegram.ownerId,
+                    enabled = telegram.enabled,
                     alertMinLevel = runtime.alertMinLevel,
                     alertAfterEncounters = runtime.alertAfterEncounters,
                     narrowCrops = runtime.narrowCrops,

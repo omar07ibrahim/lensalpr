@@ -148,6 +148,28 @@ data class ScanConfig(
         const val MIN_DWELL_SECONDS = 1
         const val MAX_DWELL_SECONDS = 120
 
+        /** Just the bot credentials, read fresh. */
+        data class Telegram(val token: String, val ownerId: Long, val enabled: Boolean)
+
+        /**
+         * Reads the Telegram credentials without building a whole [ScanConfig].
+         *
+         * The bot lives in a service that outlives every screen, so it cannot capture these once
+         * and be done: a token corrected on the setup screen has to reach a bot that is already
+         * running. Kept separate from [load] because that one parses the lens plan, and this is
+         * called on every message that arrives.
+         */
+        fun telegram(context: Context): Telegram {
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            return Telegram(
+                token = prefs.getString(KEY_TG_TOKEN, "").orEmpty().trim()
+                    .ifBlank { TelegramDefaults.BOT_TOKEN },
+                ownerId = prefs.getLong(KEY_TG_OWNER, 0L)
+                    .takeIf { it != 0L } ?: TelegramDefaults.OWNER_ID,
+                enabled = prefs.getBoolean(KEY_TG_ENABLED, TelegramDefaults.ENABLED),
+            )
+        }
+
         fun load(context: Context, setup: RearCameraSetup?): ScanConfig {
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
             val storedPlan = parsePlan(prefs.getString(KEY_PLAN, null))

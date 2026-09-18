@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import com.lensalpr.app.BotService
 import com.lensalpr.app.R
@@ -64,6 +65,7 @@ class LockActivity : AppCompatActivity() {
         setContentView(binding.root)
         // Nothing here should ever end up in a screenshot or the recents thumbnail.
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        refuseBack()
 
         if (LockStore.isLockedOut(this)) {
             showBlank()
@@ -95,9 +97,20 @@ class LockActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    /** The back gesture must not be a way past the door. */
-    override fun onBackPressed() {
-        moveTaskToBack(true)
+    /**
+     * The back gesture must not be a way past the door.
+     *
+     * Through the dispatcher rather than `onBackPressed`, which the platform stopped calling for
+     * gesture navigation — the override compiled, looked right, and simply never ran on a modern
+     * phone. Backing out sends the task away instead of finishing, so the lock screen is still
+     * there when the app is opened again.
+     */
+    private fun refuseBack() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                moveTaskToBack(true)
+            }
+        })
     }
 
     private fun renderHint(creating: Boolean) {
@@ -177,6 +190,7 @@ class LockActivity : AppCompatActivity() {
                 WindowManager.LayoutParams.FLAG_SECURE,
                 WindowManager.LayoutParams.FLAG_SECURE,
             )
+            refuseBack()
         }
         binding.prompt.visibility = View.GONE
         binding.blank.visibility = View.VISIBLE
