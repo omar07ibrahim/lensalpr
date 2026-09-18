@@ -233,6 +233,26 @@ class TrackingStore(context: Context) {
                 false
             }.getOrDefault(false)
 
+        /**
+         * Opens a database written by a *newer* build instead of refusing it.
+         *
+         * The default implementation throws, which would take the app down on its first query. On
+         * a phone that gets sideloaded builds from a working branch this is not an exotic case —
+         * it is what happens any time an older build is installed over a newer one, and it would
+         * look like the app is broken rather than like the schema is ahead.
+         *
+         * Safe because every schema change this project has made is additive: later versions add
+         * columns and tables, none rename or drop anything. Extra columns are simply not read, and
+         * they keep their defaults on insert because every write names its columns explicitly. The
+         * newer schema is left exactly as it is — nothing is dropped to "restore" the old shape,
+         * which is the one thing that really would lose evidence.
+         */
+        override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+            Log.w(TAG, "database is at v$oldVersion, this build expects v$newVersion; keeping it")
+            // Only fills in anything a newer build might somehow be missing; all IF NOT EXISTS.
+            onCreate(db)
+        }
+
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
             // Every statement is CREATE ... IF NOT EXISTS, so an upgrade adds the missing pieces
             // and leaves the collected evidence alone.
